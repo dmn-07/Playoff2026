@@ -363,13 +363,80 @@ def discover_standings_views(source_url, tournament_id="539", known=None):
     return unique_keep_order(candidates)
 
 def scrape_standings_url(url):
-    """Devuelve todas las tablas de posiciones válidas de una URL FMV."""
+    """Lee una tabla de posiciones FMV de forma robusta.
+
+    Primero usa pandas y, si el HTML de FMV no se deja interpretar bien,
+    hace un parseo directo de las filas <tr>.
+    """
     html, final_url = request_html(url)
     results = []
+
+    # 1) Parser habitual.
     for df in tables_from_html(html):
         parsed = dataframe_to_standings(df)
         if parsed is not None and len(parsed) >= 4:
             results.append({"table": parsed, "url": final_url})
+
+    if results:
+        return results
+
+    # 2) Fallback directo para cambios en el HTML de FMV.
+    soup = BeautifulSoup(html, "html.parser")
+    for table in soup.find_all("table"):
+        rows = table.find_all("tr")
+        if not rows:
+            continue
+
+        header = [normalize(c.get_text(" ", strip=True)).lower()
+                  for c in rows[0].find_all(["th", "td"])]
+        if not any(h in {"equipo", "team", "club"} or "equipo" in h for h in header):
+            # Buscar una fila de encabezado dentro de las primeras filas.
+            header = []
+            header_index = None
+            for idx, row in enumerate(rows[:4]):
+                hs = [normalize(c.get_text(" ", strip=True)).lower()
+                      for c in row.find_all(["th", "td"])]
+                if any("equipo" in h or h in {"team", "club"} for h in hs):
+                    header, header_index = hs, idx
+                    break
+            if header_index is None:
+                continue
+        else:
+            header_index = 0
+
+        team_idx = next((i for i, h in enumerate(header)
+                         if "equipo" in h or h in {"team", "club"}), None)
+        pts_idx = next((i for i, h in enumerate(header)
+                        if h in {"pts", "puntos", "puntos totales"} or h.startswith("pts")), None)
+        if team_idx is None or pts_idx is None:
+            continue
+
+        data = []
+        for row in rows[header_index + 1:]:
+            cells = row.find_all(["th", "td"])
+            texts = [normalize(c.get_text(" ", strip=True)) for c in cells]
+            if len(texts) <= max(team_idx, pts_idx):
+                continue
+            team = clean_team_name(texts[team_idx])
+            if not team:
+                continue
+            pos = pd.to_numeric(texts[0], errors="coerce")
+            pts = pd.to_numeric(texts[pts_idx], errors="coerce")
+            if pd.isna(pos) or pd.isna(pts):
+                continue
+            row_out = {"Pos": int(pos), "Equipo": team, "PTS": float(pts)}
+            # Copiar el resto de columnas conocidas cuando existan.
+            for i, name in enumerate(header):
+                if i >= len(texts):
+                    continue
+                if name.upper() in {"PG", "PJ", "PP", "DS", "SG", "SP", "DT", "TG", "TP"}:
+                    row_out[name.upper()] = pd.to_numeric(texts[i], errors="coerce")
+            data.append(row_out)
+
+        if len(data) >= 4:
+            parsed = pd.DataFrame(data).sort_values("Pos").reset_index(drop=True)
+            results.append({"table": parsed, "url": final_url})
+
     return results
 
 # La Rueda Reubicación se obtiene de los equipos 9° a 16° de la clasificación.
@@ -640,48 +707,77 @@ def scrape_reubic_from_fixture(source_url, reub_teams, all_teams=None):
 
 
 def scrape_second_stage(source_url):
-    """Lee directamente las tablas oficiales de la segunda etapa de FMV.
+    """Obtiene Campeonato y Reubicación de Cuarta 2026.
 
-    No recalcula puntos a partir de los partidos: usa la columna PTS que publica
-    FMV. La vista conocida group=5974 corresponde a Campeonato; las demás tablas
-    oficiales de 8 equipos descubiertas en la misma etapa se consideran candidatas
-    a Reubicación.
+    Prioridad:
+    1. Tabla oficial de FMV.
+    2. Si FMV no expone la vista Reubicación como selector/enlace, se usa
+       como respaldo la información de partidos de los mismos ocho equipos y
+       se aplica la regla oficial de arrastre del 50%.
+
+    Nunca se reemplaza una tabla real por Mock Data.
     """
     campeonato = None
     reubic = None
 
+    # La vista oficial conocida de Campeonato se consulta directamente.
+    try:
+        for item in scrape_standings_url(KNOWN_STANDINGS[0]):
+            table = item["table"].copy()
+            if len(table) == 8:
+                table = table.sort_values("Pos").reset_index(drop=True)
+                table["Pos"] = range(1, 9)
+                campeonato = {"table": table, "url": item["url"]}
+                break
+    except Exception:
+        pass
+
+    # Intentar descubrir la vista oficial de Reubicación.
     views = discover_standings_views(
         source_url,
         tournament_id="539",
         known=KNOWN_STANDINGS,
     )
 
-    # La vista conocida es la fuente principal del Campeonato.
+    championship_urls = {u.rstrip("/") for u in KNOWN_STANDINGS}
     for url in views:
+        if url.rstrip("/") in championship_urls:
+            continue
         try:
             tables = scrape_standings_url(url)
         except Exception:
             continue
-
         for item in tables:
             table = item["table"].copy()
             if len(table) != 8:
                 continue
+            table = table.sort_values("Pos").reset_index(drop=True)
+            # Evitar aceptar otra vista de Campeonato repetida.
+            teams = set(table["Equipo"].astype(str).str.upper())
+            champ_teams = set() if campeonato is None else set(campeonato["table"]["Equipo"].astype(str).str.upper())
+            if champ_teams and teams == champ_teams:
+                continue
+            table["Pos"] = range(9, 17)
+            reubic = {"table": table, "url": item["url"]}
+            break
+        if reubic is not None:
+            break
 
-            low_url = url.lower()
-            is_known_championship = (
-                url.rstrip("/") == KNOWN_STANDINGS[0].rstrip("/")
-                or "group=5974" in low_url
+    # Fallback real para Reubicación: no inventa equipos ni puntos.
+    if reubic is None:
+        try:
+            fallback = scrape_reubic_from_fixture(
+                source_url,
+                REUB_TEAMS_FALLBACK,
+                all_teams=REUB_TEAMS_FALLBACK,
             )
-
-            if is_known_championship and campeonato is None:
-                table = table.sort_values("Pos").reset_index(drop=True)
-                table["Pos"] = range(1, 9)
-                campeonato = {"table": table, "url": item["url"]}
-            elif not is_known_championship and reubic is None:
-                table = table.sort_values("Pos").reset_index(drop=True)
-                table["Pos"] = range(9, 17)
-                reubic = {"table": table, "url": item["url"]}
+            if fallback is not None and len(fallback) == 8:
+                reubic = {
+                    "table": fallback,
+                    "url": "FMV — partidos oficiales + regla de arrastre 50%",
+                }
+        except Exception:
+            reubic = None
 
     result = {}
     if campeonato is not None:
@@ -775,7 +871,7 @@ def load_data(url_cuarta, url_quinta):
     else:
         reubic = pd.DataFrame({"Pos": pd.Series(dtype="int"), "Equipo": pd.Series(dtype="str")})
         source_r = "No encontrada"
-        errors.append("No se pudo localizar la tabla oficial de Rueda Reubicación en FMV.")
+        errors.append("No se pudo localizar la tabla oficial de Rueda Reubicación en FMV ni reconstruirla desde los partidos oficiales.")
 
     quinta_results = scrape_quinta(url_quinta)
     if quinta_results:
