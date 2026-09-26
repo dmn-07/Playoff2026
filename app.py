@@ -169,16 +169,24 @@ def dataframe_to_standings(df):
 
 
 def extract_standings_links(source_url, html, final_url, tournament_id="539"):
-    """Encuentra vistas de posiciones, incluidos parámetros embebidos en la página."""
+    """
+    Encuentra todas las vistas de posiciones.
+
+    FMV tiene dos selectores en la página de Posiciones: uno para la etapa
+    (p. ej. Primera/Segunda etapa) y otro para la rueda (Campeonato/Reubicación).
+    Es importante leer los <select>/<option>, porque esas opciones no aparecen
+    como enlaces <a> y por eso el scraper anterior nunca llegaba a Reubicación.
+    """
     links = []
     soup = BeautifulSoup(html, "html.parser")
+    standings_base = f"https://metrovoley.com.ar/tournaments/{tournament_id}/standings"
 
     for a in soup.find_all("a", href=True):
         href = urljoin(final_url, a["href"])
         if f"/tournaments/{tournament_id}/standings" in href.lower():
             links.append(href)
 
-    # URLs absolutas y relativas que puedan estar embebidas en scripts/JSON.
+    # URLs absolutas y relativas embebidas en scripts/JSON.
     patterns = [
         rf'https?://[^"\'<> ]*/tournaments/{tournament_id}/standings[^"\'<> ]*',
         rf'/tournaments/{tournament_id}/standings[^"\'<> ]*',
@@ -187,25 +195,90 @@ def extract_standings_links(source_url, html, final_url, tournament_id="539"):
         for m in re.findall(pattern, html, flags=re.I):
             links.append(urljoin(final_url, m.replace("&amp;", "&")))
 
-    # Algunos frontends no imprimen la URL completa: dejan stage/group en
-    # atributos, opciones o JSON. Capturamos pares cercanos y construimos la URL.
+    # Capturar pares group/stage que ya estén escritos en HTML/JS.
     pair_patterns = [
-        r'[?&]group=(\d+)[^"\'<>]{0,180}[?&]stage=(\d+)',
-        r'[?&]stage=(\d+)[^"\'<>]{0,180}[?&]group=(\d+)',
-        r'"group"\s*:\s*"?(\d+)"?[^{}]{0,180}?"stage"\s*:\s*"?(\d+)"?',
-        r'"stage"\s*:\s*"?(\d+)"?[^{}]{0,180}?"group"\s*:\s*"?(\d+)"?',
+        (r'[?&]group=(\d+)[^"\'<>]{0,220}[?&]stage=(\d+)', False),
+        (r'[?&]stage=(\d+)[^"\'<>]{0,220}[?&]group=(\d+)', True),
+        (r'"group"\s*:\s*"?(\d+)"?[^{}]{0,220}?"stage"\s*:\s*"?(\d+)"?', False),
+        (r'"stage"\s*:\s*"?(\d+)"?[^{}]{0,220}?"group"\s*:\s*"?(\d+)"?', True),
     ]
-    for pat in pair_patterns:
+    for pat, reversed_order in pair_patterns:
         for m in re.finditer(pat, html, flags=re.I):
-            a, b = m.group(1), m.group(2)
-            if 'stage' in pat.split('(')[0].lower() or 'stage' in pat[:20].lower():
-                stage, group = a, b
+            if reversed_order:
+                stage, group = m.group(1), m.group(2)
             else:
-                group, stage = a, b
-            links.append(
-                f"https://metrovoley.com.ar/tournaments/{tournament_id}/standings?"
-                f"group={group}&stage={stage}"
-            )
+                group, stage = m.group(1), m.group(2)
+            links.append(f"{standings_base}?group={group}&stage={stage}")
+
+    # ===== CLAVE: leer los dos selectores reales de FMV =====
+    selects = []
+    for sel in soup.find_all("select"):
+        options = []
+        for opt in sel.find_all("option"):
+            value = normalize(opt.get("value"))
+            label = normalize(opt.get_text(" ", strip=True))
+            if value:
+                options.append((value, label))
+        if options:
+            meta = " ".join([
+                normalize(sel.get("name")),
+                normalize(sel.get("id")),
+                normalize(sel.get("class")),
+                normalize(sel.get("data-param")),
+                normalize(sel.get("data-name")),
+            ]).lower()
+            selects.append({"meta": meta, "options": options})
+
+    # Identificar cuál selector es group y cuál stage usando los valores que
+    # conocemos de la URL actual. Si el HTML no trae esos valores, también
+    # usamos el nombre/id del selector.
+    group_options = []
+    stage_options = []
+    for sel in selects:
+        meta = sel["meta"]
+        if "group" in meta or "rueda" in meta or "zona" in meta:
+            group_options.extend(sel["options"])
+        if "stage" in meta or "etapa" in meta or "fase" in meta:
+            stage_options.extend(sel["options"])
+
+    # Fallback por valores conocidos de la vista actual.
+    if not group_options:
+        for sel in selects:
+            if any(v == "5974" for v, _ in sel["options"]):
+                group_options = sel["options"]
+                break
+    if not stage_options:
+        for sel in selects:
+            if any(v == "2067" for v, _ in sel["options"]):
+                stage_options = sel["options"]
+                break
+
+    # Fallback final: cualquier selector distinto del de group se considera
+    # candidato a stage. Esto permite tolerar cambios menores del frontend.
+    if group_options and not stage_options:
+        for sel in selects:
+            if sel["options"] is not group_options:
+                stage_options.extend(sel["options"])
+
+    current_stage = "2067"
+    for value, label in stage_options:
+        if value == "2067" or "segunda etapa" in label.lower():
+            current_stage = value
+            break
+
+    # Construir específicamente las vistas de Segunda etapa / Campeonato y
+    # Segunda etapa / Reubicación a partir de las opciones que muestra FMV.
+    for value, label in group_options:
+        low = label.lower()
+        if "campeonato" in low or "reubic" in low:
+            links.append(f"{standings_base}?group={value}&stage={current_stage}")
+
+    # Si el selector no etiqueta claramente las ruedas, probar combinaciones
+    # con la etapa actual. Luego el parser de tablas/etapas decide cuál es válida.
+    if group_options:
+        for value, label in group_options:
+            if value != "5974":
+                links.append(f"{standings_base}?group={value}&stage={current_stage}")
 
     if "/standings" in source_url.lower():
         links.append(source_url)
@@ -213,20 +286,21 @@ def extract_standings_links(source_url, html, final_url, tournament_id="539"):
 
 
 def discover_standings_views(source_url, tournament_id="539", known=None):
-    """Descubre vistas de posiciones de un torneo FMV."""
+    """Descubre vistas de posiciones, incluyendo las opciones de los selectores FMV."""
     candidates = list(known or [])
-    try:
-        html, final_url = request_html(source_url)
-        candidates.extend(extract_standings_links(source_url, html, final_url, tournament_id))
-    except Exception:
-        pass
 
+    # Hay que inspeccionar la vista conocida porque allí están los <select> que
+    # contienen el ID de Reubicación aunque no exista un enlace <a> hacia ella.
+    seed_urls = unique_keep_order(candidates + [source_url])
     base = f"https://metrovoley.com.ar/tournaments/{tournament_id}/standings"
-    try:
-        html, final_url = request_html(base)
-        candidates.extend(extract_standings_links(base, html, final_url, tournament_id))
-    except Exception:
-        pass
+    seed_urls.append(base)
+
+    for seed in unique_keep_order(seed_urls):
+        try:
+            html, final_url = request_html(seed)
+            candidates.extend(extract_standings_links(seed, html, final_url, tournament_id))
+        except Exception:
+            continue
 
     return unique_keep_order(candidates)
 
@@ -583,6 +657,9 @@ st.markdown("""
     margin-bottom: 12px;
 }
 .team-row, .team-row * {
+    color: #111827 !important;
+}
+.team-row, .team-row p, .team-row span, .team-row div {
     color: #111827 !important;
 }
 .team-row {
