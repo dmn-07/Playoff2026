@@ -168,48 +168,67 @@ def dataframe_to_standings(df):
     return out
 
 
-def extract_standings_links(source_url, html, final_url):
-    """Encuentra todas las vistas de posiciones del torneo actual."""
+def extract_standings_links(source_url, html, final_url, tournament_id="539"):
+    """Encuentra vistas de posiciones, incluidos parámetros embebidos en la página."""
     links = []
     soup = BeautifulSoup(html, "html.parser")
 
-    # Enlaces explícitos.
     for a in soup.find_all("a", href=True):
         href = urljoin(final_url, a["href"])
-        if "/standings" in href.lower() and "tournaments/539" in href.lower():
+        if f"/tournaments/{tournament_id}/standings" in href.lower():
             links.append(href)
 
-    # También aparecen como opciones/selects o dentro del HTML embebido.
-    for m in re.findall(r'https?://[^\"\'<> ]*tournaments/539/standings[^\"\'<> ]*', html):
-        links.append(m.replace("&amp;", "&"))
+    # URLs absolutas y relativas que puedan estar embebidas en scripts/JSON.
+    patterns = [
+        rf'https?://[^"\'<> ]*/tournaments/{tournament_id}/standings[^"\'<> ]*',
+        rf'/tournaments/{tournament_id}/standings[^"\'<> ]*',
+    ]
+    for pattern in patterns:
+        for m in re.findall(pattern, html, flags=re.I):
+            links.append(urljoin(final_url, m.replace("&amp;", "&")))
 
-    # Si la URL que nos dieron ya es una vista de posiciones, conservarla.
+    # Algunos frontends no imprimen la URL completa: dejan stage/group en
+    # atributos, opciones o JSON. Capturamos pares cercanos y construimos la URL.
+    pair_patterns = [
+        r'[?&]group=(\d+)[^"\'<>]{0,180}[?&]stage=(\d+)',
+        r'[?&]stage=(\d+)[^"\'<>]{0,180}[?&]group=(\d+)',
+        r'"group"\s*:\s*"?(\d+)"?[^{}]{0,180}?"stage"\s*:\s*"?(\d+)"?',
+        r'"stage"\s*:\s*"?(\d+)"?[^{}]{0,180}?"group"\s*:\s*"?(\d+)"?',
+    ]
+    for pat in pair_patterns:
+        for m in re.finditer(pat, html, flags=re.I):
+            a, b = m.group(1), m.group(2)
+            if 'stage' in pat.split('(')[0].lower() or 'stage' in pat[:20].lower():
+                stage, group = a, b
+            else:
+                group, stage = a, b
+            links.append(
+                f"https://metrovoley.com.ar/tournaments/{tournament_id}/standings?"
+                f"group={group}&stage={stage}"
+            )
+
     if "/standings" in source_url.lower():
         links.append(source_url)
-
     return unique_keep_order(links)
 
 
-def discover_standings_views(source_url):
-    """Descubre las vistas de posiciones de la segunda etapa en FMV."""
-    candidates = list(KNOWN_STANDINGS)
+def discover_standings_views(source_url, tournament_id="539", known=None):
+    """Descubre vistas de posiciones de un torneo FMV."""
+    candidates = list(known or [])
     try:
         html, final_url = request_html(source_url)
-        candidates.extend(extract_standings_links(source_url, html, final_url))
+        candidates.extend(extract_standings_links(source_url, html, final_url, tournament_id))
     except Exception:
         pass
 
-    # Probar la página de posiciones sin parámetros también: suele contener
-    # los selectores de etapa/grupo aunque no estén como links normales.
-    base = "https://metrovoley.com.ar/tournaments/539/standings"
+    base = f"https://metrovoley.com.ar/tournaments/{tournament_id}/standings"
     try:
         html, final_url = request_html(base)
-        candidates.extend(extract_standings_links(base, html, final_url))
+        candidates.extend(extract_standings_links(base, html, final_url, tournament_id))
     except Exception:
         pass
 
     return unique_keep_order(candidates)
-
 
 def scrape_standings_url(url):
     """Devuelve todas las tablas de posiciones válidas de una URL FMV."""
@@ -223,42 +242,39 @@ def scrape_standings_url(url):
 
 
 def scrape_second_stage(source_url):
-    """
-    Obtiene exclusivamente las tablas de la segunda etapa del torneo 539.
+    """Obtiene las tablas actuales de Campeonato y Reubicación del torneo 539."""
+    views = discover_standings_views(source_url, "539", KNOWN_STANDINGS)
 
-    La versión anterior dependía de IDs antiguos de DataProject y terminaba
-    en Mock Data. Ahora parte de la web actual de FMV y descubre sus vistas.
-    No acepta la Rueda Clasificación (15 partidos/16 equipos) como segunda etapa.
-    """
-    views = discover_standings_views(source_url)
+    # Si el selector de FMV no deja visibles los links en HTML, probamos una
+    # pequeña vecindad de stages alrededor del stage conocido. Los inválidos
+    # simplemente se descartan; nunca se convierten en datos ficticios.
+    try:
+        qs = parse_qs(urlparse(KNOWN_STANDINGS[0]).query)
+        group = qs.get("group", [None])[0]
+        stage = int(qs.get("stage", [0])[0])
+        if group and stage:
+            for sid in range(stage - 3, stage + 6):
+                views.append(
+                    f"https://metrovoley.com.ar/tournaments/539/standings?group={group}&stage={sid}"
+                )
+    except Exception:
+        pass
+    views = unique_keep_order(views)
+
     found = []
-
     for url in views:
         try:
             html, final_url = request_html(url)
             soup = BeautifulSoup(html, "html.parser")
             page_text = normalize(soup.get_text(" ", strip=True)).lower()
-            parsed_tables = []
             for df in tables_from_html(html):
                 parsed = dataframe_to_standings(df)
-                if parsed is not None and len(parsed) >= 4:
-                    parsed_tables.append(parsed)
-
-            for parsed in parsed_tables:
-                # La clasificación tiene 16 equipos. Las ruedas de segunda
-                # etapa son las tablas pequeñas que aparecen después.
-                if len(parsed) not in (7, 8):
+                if parsed is None or len(parsed) not in (7, 8):
                     continue
-
-                found.append({
-                    "table": parsed,
-                    "url": final_url,
-                    "text": page_text,
-                })
+                found.append({"table": parsed, "url": final_url, "text": page_text})
         except Exception:
             continue
 
-    # Elimina duplicados por conjunto de equipos.
     unique = []
     signatures = set()
     for item in found:
@@ -267,12 +283,8 @@ def scrape_second_stage(source_url):
             signatures.add(sig)
             unique.append(item)
 
-    # Identificación robusta por tamaño + nombres de etapa si FMV los expone.
-    # Si solo aparece una tabla de 8, se toma como Campeonato porque la vista
-    # actual conocida de stage=2067 es la Rueda Campeonato.
     campeonato = None
     reubic = None
-
     for item in unique:
         t = item["text"]
         if "rueda campeonato" in t:
@@ -280,28 +292,35 @@ def scrape_second_stage(source_url):
         elif "rueda reubic" in t:
             reubic = item
 
-    known = KNOWN_STANDINGS[0]
+    known_base = urlparse(KNOWN_STANDINGS[0]).path
     for item in unique:
-        if item["url"].split("?")[0] == known.split("?")[0] and "group=5974" in item["url"] and "stage=2067" in item["url"]:
-            campeonato = campeonato or item
+        parsed_url = urlparse(item["url"])
+        if parsed_url.path == known_base:
+            q = parse_qs(parsed_url.query)
+            if q.get("group", [""])[0] == "5974" and q.get("stage", [""])[0] == "2067":
+                campeonato = campeonato or item
 
     if campeonato is None:
-        # Elegir la tabla de 8 que tenga los equipos que actualmente figuran
-        # arriba en la segunda fase; evita usar la tabla de clasificación.
+        # La vista conocida de 8 equipos es la segunda fase Campeonato.
         for item in unique:
             if len(item["table"]) == 8:
                 campeonato = item
                 break
 
-    # La segunda tabla pequeña se considera Reubicación. Si la FMV publica
-    # 7 equipos, se mantiene su numeración 9..15 y el puesto 16 queda vacío;
-    # si publica 8, queda 9..16.
     for item in unique:
         if campeonato is not None and item is campeonato:
             continue
-        if "rueda reubic" in item["text"] or len(item["table"]) in (7, 8):
+        if "rueda reubic" in item["text"]:
             reubic = item
             break
+
+    # Si no hay texto de etapa, elegir otra tabla de 7/8 equipos distinta de
+    # Campeonato. Esto mantiene fuera la Rueda Clasificación de 16 equipos.
+    if reubic is None:
+        for item in unique:
+            if campeonato is None or item["table"].equals(campeonato["table"]) is False:
+                reubic = item
+                break
 
     selected = {}
     if campeonato is not None:
@@ -334,46 +353,31 @@ def make_mock_second_stage():
 
 
 def scrape_quinta(source_url):
-    """
-    Busca las tablas de Campeonato de Quinta.
-    Como Quinta puede tener más de una zona, devuelve hasta los dos primeros
-    equipos de cada tabla/zona que encuentre.
-    """
+    """Obtiene las tablas actuales de Quinta desde la web pública de FMV."""
     results = []
-
-    candidates = []
-    if "fmv-web.dataproject.com" in source_url:
-        candidates = [source_url]
-    else:
+    views = discover_standings_views(
+        source_url,
+        "540",
+        ["https://metrovoley.com.ar/tournaments/540/standings"],
+    )
+    for url in views:
         try:
-            candidates = get_dataproject_candidates(
-                source_url, ["quinta", "campeonato", "standing", "standings"]
-            )
-        except Exception:
-            candidates = []
-
-    for url in candidates:
-        try:
-            html, final = request_html(url)
-            soup = BeautifulSoup(html, "html.parser")
-            page_text = normalize(soup.get_text(" ", strip=True))
-            if "quinta" not in page_text.lower() and "quinta" not in final.lower():
-                continue
-
-            stage = classify_stage(page_text + " " + final)
+            html, final_url = request_html(url)
             for df in tables_from_html(html):
                 parsed = dataframe_to_standings(df)
                 if parsed is not None and len(parsed) >= 2:
-                    results.append({
-                        "table": parsed,
-                        "url": final,
-                        "stage": stage,
-                    })
+                    results.append({"table": parsed, "url": final_url, "stage": "FMV"})
         except Exception:
             continue
 
-    return results
-
+    # Deduplicar tablas idénticas.
+    out, seen = [], set()
+    for item in results:
+        sig = tuple(item["table"]["Equipo"].astype(str).str.upper().tolist())
+        if sig not in seen:
+            seen.add(sig)
+            out.append(item)
+    return out
 
 def mock_quinta():
     return [
@@ -398,41 +402,36 @@ def load_data(url_cuarta, url_quinta):
     errors = []
 
     second = scrape_second_stage(url_cuarta)
-    if "Rueda Campeonato" in second and "Rueda Reubicación" in second:
+
+    # Importante: cada rueda se conserva de forma independiente. Antes, si
+    # faltaba Reubicación, se reemplazaban también los datos reales de Campeonato
+    # por Mock Data, que era exactamente lo que aparecía en el teléfono.
+    if "Rueda Campeonato" in second:
         campeonato = second["Rueda Campeonato"]["table"].copy()
-        reubic = second["Rueda Reubicación"]["table"].copy()
-        source_c = "DataProject / FMV — segunda etapa validada"
+        source_c = "FMV — Campeonato en vivo"
     else:
-        campeonato, reubic = make_mock_second_stage()
+        campeonato, _ = make_mock_second_stage()
         source_c = "Mock Data"
-        missing = []
-        if "Rueda Campeonato" not in second:
-            missing.append("Rueda Campeonato")
-        if "Rueda Reubicación" not in second:
-            missing.append("Rueda Reubicación")
-        errors.append(
-            "Blindaje activado: no se encontraron/validaron "
-            + " y ".join(missing)
-            + ". No se mezclaron datos de Rueda Clasificación; se usa Mock Data."
-        )
+        errors.append("No se pudo obtener Rueda Campeonato desde FMV.")
+
+    if "Rueda Reubicación" in second:
+        reubic = second["Rueda Reubicación"]["table"].copy()
+        source_r = "FMV — Reubicación en vivo"
+    else:
+        # No inventar posiciones 9-16. Dejamos una tabla vacía para que la app
+        # pueda mostrar lo que sí está validado y marcar los puestos faltantes.
+        reubic = pd.DataFrame({"Pos": pd.Series(dtype="int"), "Equipo": pd.Series(dtype="str")})
+        source_r = "No encontrada"
+        errors.append("FMV todavía no expone una vista de Rueda Reubicación detectable automáticamente.")
 
     quinta_results = scrape_quinta(url_quinta)
-    if len(quinta_results) >= 2:
+    if quinta_results:
         quinta_tables = [x["table"] for x in quinta_results[:4]]
-        source_q = "DataProject / FMV — datos en vivo"
-    elif len(quinta_results) == 1:
-        quinta_tables = [quinta_results[0]["table"]]
-        source_q = "DataProject — una tabla encontrada"
-        errors.append(
-            "Solo se encontró una tabla de Quinta; se completó con Mock Data."
-        )
-        quinta_tables.append(mock_quinta()[1])
+        source_q = "FMV — datos en vivo"
     else:
-        quinta_tables = mock_quinta()
-        source_q = "Mock Data"
-        errors.append(
-            "No se pudieron localizar las tablas de Quinta en DataProject."
-        )
+        quinta_tables = []
+        source_q = "No encontrada"
+        errors.append("No se pudieron localizar las tablas de Quinta en la web pública de FMV.")
 
     return campeonato, reubic, quinta_tables, source_c, source_q, errors
 
@@ -442,9 +441,11 @@ def load_data(url_cuarta, url_quinta):
 # ============================================================
 
 def team_at(df, pos):
+    if df is None or df.empty or "Pos" not in df.columns or "Equipo" not in df.columns:
+        return f"Puesto {pos} (pendiente FMV)"
     row = df[df["Pos"] == pos]
     if row.empty:
-        return f"Puesto {pos}"
+        return f"Puesto {pos} (pendiente FMV)"
     return clean_team_name(row.iloc[0]["Equipo"])
 
 
@@ -573,10 +574,16 @@ st.markdown("""
     box-shadow: 0 3px 12px rgba(15,23,42,.06);
     min-height: 170px;
 }
+.match-title, .match-title * {
+    color: #111827 !important;
+}
 .match-title {
     font-weight: 800;
     font-size: 1rem;
     margin-bottom: 12px;
+}
+.team-row, .team-row * {
+    color: #111827 !important;
 }
 .team-row {
     border: 1px solid #e2e8f0;
@@ -593,6 +600,7 @@ st.markdown("""
     padding: 5px 0;
 }
 .match-note {
+    color: #475569 !important;
     margin-top: 10px;
     font-size: .75rem;
     color: #64748b;
@@ -603,6 +611,8 @@ st.markdown("""
     background: #ecfdf5;
     border: 1px solid #a7f3d0;
 }
+div[data-testid="stAlert"] * { color: #111827 !important; }
+.stDataFrame, .stDataFrame * { color: #111827 !important; }
 .source-mock {
     padding: 10px 14px;
     border-radius: 10px;
@@ -666,10 +676,9 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-if source_c == "DataProject / FMV — segunda etapa validada":
+if source_c == "FMV — Campeonato en vivo" and not reubic.empty:
     st.markdown(
-        '<div class="source-ok">🟢 Datos en vivo validados: '
-        'Rueda Campeonato (1°–8°) + Rueda Reubicación (9°–16°). '
+        '<div class="source-ok">🟢 Datos en vivo validados de la segunda etapa de FMV. '
         'La Rueda Clasificación queda excluida.</div>',
         unsafe_allow_html=True,
     )
@@ -680,15 +689,15 @@ if source_c == "Mock Data":
         'se pudieron obtener las dos tablas de segunda etapa.</div>',
         unsafe_allow_html=True,
     )
-else:
+elif source_c == "FMV — Campeonato en vivo":
     st.markdown(
-        '<div class="source-ok">🟢 Cuarta: posiciones obtenidas desde la fuente '
-        'FMV / DataProject.</div>',
+        '<div class="source-ok">🟢 Cuarta: Campeonato obtenido en vivo desde FMV. '
+        'La Reubicación se muestra solo cuando FMV la publica/detecta.</div>',
         unsafe_allow_html=True,
     )
 
 for err in errors:
-    st.warning(err)
+    st.info(err)
 
 tab1, tab2, tab3 = st.tabs([
     "📊 Posiciones",
@@ -707,7 +716,7 @@ with tab1:
 
     with c2:
         st.subheader("Rueda Reubicación")
-        st.caption("Numeración general 9° al 16° para determinar Play Off y Play Out.")
+        st.caption("Numeración general 9° al 16°. Se muestran únicamente los puestos que FMV haya publicado.")
         st.dataframe(reubic, use_container_width=True, hide_index=True)
 
     st.divider()
@@ -733,11 +742,13 @@ with tab2:
     render_playoff(campeonato, reubic, quinta_tables)
 
 with tab3:
-    render_playout(reubic)
+    if reubic.empty:
+        st.info("La Rueda Reubicación todavía no fue detectada desde FMV; por eso no se inventan equipos en el Play Out.")
+    else:
+        render_playout(reubic)
 
 st.divider()
 st.caption(
-    "Fuente configurada: Federación Metropolitana de Voleibol / DataProject. "
-    "La app intenta obtener las etapas de segunda ronda y activa Mock Data si la "
-    "fuente no responde o cambia su estructura."
+    "Fuente: Federación Metropolitana de Voleibol. La app prioriza datos reales y "
+    "no reemplaza una rueda válida por Mock Data si falta otra tabla."
 )
