@@ -640,41 +640,55 @@ def scrape_reubic_from_fixture(source_url, reub_teams, all_teams=None):
 
 
 def scrape_second_stage(source_url):
-    """Obtiene Campeonato y calcula Reubicación con la misma regla para los 8."""
+    """Lee directamente las tablas oficiales de la segunda etapa de FMV.
+
+    No recalcula puntos a partir de los partidos: usa la columna PTS que publica
+    FMV. La vista conocida group=5974 corresponde a Campeonato; las demás tablas
+    oficiales de 8 equipos descubiertas en la misma etapa se consideran candidatas
+    a Reubicación.
+    """
     campeonato = None
-    try:
-        html, final_url = request_html(KNOWN_STANDINGS[0], timeout=20)
-        for df in tables_from_html(html):
-            parsed = dataframe_to_standings(df)
-            if parsed is not None and len(parsed) == 8:
-                parsed = parsed.sort_values("Pos").reset_index(drop=True)
-                parsed["Pos"] = range(1, 9)
-                campeonato = {"table": parsed, "url": final_url}
-                break
-    except Exception:
-        pass
+    reubic = None
 
-    if campeonato is None:
-        return {}
+    views = discover_standings_views(
+        source_url,
+        tournament_id="539",
+        known=KNOWN_STANDINGS,
+    )
 
-    # Los 8 que no están en Campeonato se obtienen del conjunto oficial de
-    # clubes de Cuarta; el fallback solo identifica equipos, nunca puntos.
-    all_teams = list(dict.fromkeys(
-        list(campeonato["table"]["Equipo"]) + REUB_TEAMS_FALLBACK
-    ))
-    top8 = {normalize(x).upper() for x in campeonato["table"]["Equipo"]}
-    reub_teams = [x for x in REUB_TEAMS_FALLBACK if x.upper() not in top8]
-    if len(reub_teams) != 8:
-        return {"Rueda Campeonato": campeonato}
+    # La vista conocida es la fuente principal del Campeonato.
+    for url in views:
+        try:
+            tables = scrape_standings_url(url)
+        except Exception:
+            continue
 
-    rebuilt = scrape_reubic_from_fixture(source_url, reub_teams, all_teams)
-    return {
-        "Rueda Campeonato": campeonato,
-        "Rueda Reubicación": {
-            "table": rebuilt,
-            "url": source_url.rstrip("/") + "/fixture",
-        },
-    }
+        for item in tables:
+            table = item["table"].copy()
+            if len(table) != 8:
+                continue
+
+            low_url = url.lower()
+            is_known_championship = (
+                url.rstrip("/") == KNOWN_STANDINGS[0].rstrip("/")
+                or "group=5974" in low_url
+            )
+
+            if is_known_championship and campeonato is None:
+                table = table.sort_values("Pos").reset_index(drop=True)
+                table["Pos"] = range(1, 9)
+                campeonato = {"table": table, "url": item["url"]}
+            elif not is_known_championship and reubic is None:
+                table = table.sort_values("Pos").reset_index(drop=True)
+                table["Pos"] = range(9, 17)
+                reubic = {"table": table, "url": item["url"]}
+
+    result = {}
+    if campeonato is not None:
+        result["Rueda Campeonato"] = campeonato
+    if reubic is not None:
+        result["Rueda Reubicación"] = reubic
+    return result
 
 def make_mock_second_stage():
     # Se generan dos tablas de 8 para mantener la lógica del torneo.
@@ -761,7 +775,7 @@ def load_data(url_cuarta, url_quinta):
     else:
         reubic = pd.DataFrame({"Pos": pd.Series(dtype="int"), "Equipo": pd.Series(dtype="str")})
         source_r = "No encontrada"
-        errors.append("No se pudo calcular la Rueda Reubicación completa desde los resultados de FMV.")
+        errors.append("No se pudo localizar la tabla oficial de Rueda Reubicación en FMV.")
 
     quinta_results = scrape_quinta(url_quinta)
     if quinta_results:
@@ -988,7 +1002,7 @@ button[kind="primary"] {
 # ============================================================
 
 st.sidebar.header("⚙️ Configuración")
-st.sidebar.caption("Datos oficiales de FMV. Se calcula el 50% de arrastre para cada equipo de Reubicación.")
+st.sidebar.caption("Datos oficiales de FMV. La app lee la tabla de posiciones y usa el PTS publicado por FMV.")
 url_cuarta = st.sidebar.text_input("URL Cuarta División", URL_CUARTA)
 url_quinta = st.sidebar.text_input("URL Quinta División", URL_QUINTA)
 
@@ -1048,8 +1062,7 @@ if source_c == "FMV — Campeonato en vivo" and not reubic.empty:
 
 if source_c == "FMV — Campeonato en vivo":
     st.markdown(
-        '<div class="source-ok">🟢 Cuarta: Campeonato obtenido en vivo desde FMV. '
-        'La Reubicación se muestra solo cuando FMV la publica/detecta.</div>',
+        '<div class="source-ok">🟢 Cuarta: las posiciones se leen directamente de las tablas oficiales de FMV.</div>',
         unsafe_allow_html=True,
     )
 
@@ -1073,7 +1086,7 @@ with tab1:
 
     with c2:
         st.subheader("Rueda Reubicación")
-        st.caption("Numeración general 9° al 16°. PTS = 50% de la Clasificación + puntos de la Rueda Reubicación, aplicado por igual a los 8 equipos.")
+        st.caption("Numeración general 9° al 16°. PTS se toma directamente de la tabla oficial de FMV, incluyendo el arrastre que FMV ya publica.")
         st.dataframe(reubic, use_container_width=True, hide_index=True)
 
     st.divider()
