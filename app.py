@@ -269,6 +269,7 @@ def discover_standings_views(source_url, tournament_id="539", known=None):
 
     return unique_keep_order(candidates)
 
+
 def scrape_standings_url(url):
     html, final_url = request_html(url)
     results = []
@@ -277,6 +278,7 @@ def scrape_standings_url(url):
         if parsed is not None and len(parsed) >= 4:
             results.append({"table": parsed, "url": final_url})
     return results
+
 
 REUB_TEAMS_FALLBACK = [
     "ASTURIA", "EP B", "GEI B", "JUVA",
@@ -292,107 +294,135 @@ def points_for_match(sets_for, sets_against):
     return 0
 
 
-def _team_page_links(source_url, teams):
-    fixture_url = source_url.rstrip("/") + "/fixture"
-    html, final_url = request_html(fixture_url, timeout=20)
+def _extract_matches_from_html(html, all_teams):
+    """Extrae partidos de cualquier página web usando flex-matching de texto plano."""
     soup = BeautifulSoup(html, "html.parser")
-    wanted = {normalize(t).upper(): t for t in teams}
-    links = {}
-
-    for a in soup.find_all("a", href=True):
-        href = urljoin(final_url, a["href"])
-        if "/teams/" not in href or "/matches" not in href:
-            continue
-        label = clean_team_name(a.get_text(" ", strip=True))
-        if not label:
-            continue
-        label_up = label.upper()
-        for upper, original in wanted.items():
-            if upper == label_up or upper in label_up or label_up in upper:
-                links[original] = href
-
-    for m in re.finditer(r'href=["\']([^"\']*/teams/\d+/matches)["\']', html, re.I):
-        href = urljoin(final_url, m.group(1))
-        before = BeautifulSoup(html[max(0, m.start()-500):m.start()+500], "html.parser").get_text(" ", strip=True)
-        for upper, original in wanted.items():
-            if upper in before.upper() and original not in links:
-                links[original] = href
-
-    return links
-
-
-def _parse_team_matches(team, team_url, all_teams):
-    html, _ = request_html(team_url, timeout=20)
-    soup = BeautifulSoup(html, "html.parser")
-    all_names = list(dict.fromkeys(all_teams))
     out = []
-
-    for a in soup.find_all("a", href=True):
-        href = urljoin(team_url, a["href"])
-        if "/matches/" not in href:
-            continue
-        
-        prev_phase = a.find_previous(string=re.compile(r"(?i)reubicaci[óo]n|clasificaci[óo]n"))
-        if prev_phase and "reubicaci" in prev_phase.lower():
-            phase = "reubic"
-        else:
-            phase = "class"
-
-        parent = a.find_parent("tr")
-        if not parent:
-            parent = a.parent
-        txt = normalize(parent.get_text(" ", strip=True))
-
-        team_occ = list(re.finditer(r"(?<![A-Z0-9])" + re.escape(team) + r"(?![A-Z0-9])", txt, re.I))
-        if not team_occ:
-            continue
-        team_pos = team_occ[-1].start()
-
-        candidates = []
-        for other in all_names:
-            if other.upper() == team.upper():
+    
+    def cln(t): return re.sub(r"[^\w]", "", t).lower()
+    team_map = {cln(t): t for t in all_teams}
+    
+    current_phase = "class"
+    
+    for el in soup.find_all(["h1", "h2", "h3", "h4", "th", "strong", "div", "tr", "li", "span", "p"]):
+        if el.name in ["h1", "h2", "h3", "h4", "th", "strong", "p", "div"]:
+            txt = el.get_text(" ", strip=True).lower()
+            if len(txt) < 100:
+                if "reubic" in txt or "ronda 2" in txt or "fase 2" in txt or "zona b" in txt:
+                    current_phase = "reubic"
+                elif "clasificaci" in txt or "ronda 1" in txt or "fase 1" in txt:
+                    current_phase = "class"
+                    
+        if el.name in ["tr", "li", "div"]:
+            if len(el.find_all(["tr", "li", "div"])) > 5:
                 continue
-            occ = list(re.finditer(r"(?<![A-Z0-9])" + re.escape(other) + r"(?![A-Z0-9])", txt, re.I))
-            if occ:
-                candidates.append((other, occ[-1]))
-        if not candidates:
-            continue
-
-        rival, rival_occ = min(candidates, key=lambda x: abs(x[1].start() - team_pos))
-        rival_pos = rival_occ.start()
-
-        sf, sa = None, None
-        for m in re.finditer(r"\b([0-3])\s*[-|:x/]?\s*([0-3])\b", txt):
-            s1, s2 = int(m.group(1)), int(m.group(2))
-            if (s1 == 3 and s2 < 3) or (s2 == 3 and s1 < 3):
-                if team_pos < rival_pos:
-                    sf, sa = s1, s2
-                else:
-                    sf, sa = s2, s1
-                break
-        
-        if sf is None or sa is None:
-            continue
-
-        match_id = re.search(r"/matches/(\d+)", href)
-        match_id = match_id.group(1) if match_id else href
-        out.append({
-            "id": match_id,
-            "phase": phase,
-            "team": team,
-            "rival": rival,
-            "sf": sf,
-            "sa": sa,
-        })
-
+                
+            txt = el.get_text(" ", strip=True)
+            if not re.search(r"\b[0-3]\s*[-|:x/]?\s*[0-3]\b", txt):
+                continue
+                
+            txt_clean = cln(txt)
+            
+            found_teams = []
+            for t_clean, t_real in team_map.items():
+                if t_clean in txt_clean:
+                    found_teams.append(t_real)
+                    
+            if len(found_teams) < 2:
+                continue
+                
+            team_a, team_b = found_teams[0], found_teams[1]
+            
+            txt_lower = txt.lower()
+            def find_pos(name, text):
+                clean_chars = list(re.sub(r"[^\w]", "", name).lower())
+                if not clean_chars: return -1
+                pattern = r"[\s\W]*".join(clean_chars)
+                m = re.search(pattern, text)
+                return m.start() if m else -1
+                
+            pos_a = find_pos(team_a, txt_lower)
+            pos_b = find_pos(team_b, txt_lower)
+            if pos_a == -1 or pos_b == -1:
+                pos_a, pos_b = 1, 2
+                
+            sf, sa = None, None
+            for m in re.finditer(r"\b([0-3])\s*[-|:x/]?\s*([0-3])\b", txt):
+                s1, s2 = int(m.group(1)), int(m.group(2))
+                if (s1 == 3 and s2 < 3) or (s2 == 3 and s1 < 3):
+                    if pos_a < pos_b:
+                        sf, sa = s1, s2
+                    else:
+                        sf, sa = s2, s1
+                    break
+                    
+            if sf is not None and sa is not None:
+                out.append({
+                    "phase": current_phase,
+                    "team": team_a,
+                    "rival": team_b,
+                    "sf": sf,
+                    "sa": sa,
+                })
     return out
 
 
 def scrape_reubic_from_fixture(source_url, reub_teams, all_teams=None):
+    """Calcula los puntos recopilando partidos del fixture general y deduciendo las fases."""
     teams = list(reub_teams)
     all_teams = list(all_teams or teams)
-    links = _team_page_links(source_url, all_teams)
-
+    
+    fixture_url = source_url.rstrip("/") + "/fixture"
+    html, final_url = request_html(fixture_url, timeout=20)
+    raw_matches = _extract_matches_from_html(html, all_teams)
+    
+    if len(raw_matches) < 20:
+        soup = BeautifulSoup(html, "html.parser")
+        def cln(t): return re.sub(r"[^\w]", "", t).lower()
+        wanted = {cln(t): t for t in all_teams}
+        links = {}
+        for a in soup.find_all("a", href=True):
+            if "/teams/" in a["href"]:
+                txt = cln(a.get_text(" ", strip=True))
+                for w, orig in wanted.items():
+                    if w in txt or txt in w:
+                        href = urljoin(final_url, a["href"])
+                        if not href.endswith("/matches"):
+                            href = href.rstrip("/") + "/matches"
+                        links[orig] = href
+                        
+        for team in all_teams:
+            url = links.get(team)
+            if url:
+                try:
+                    t_html, _ = request_html(url, timeout=15)
+                    raw_matches.extend(_extract_matches_from_html(t_html, all_teams))
+                except Exception:
+                    pass
+                    
+    pair_results = {}
+    for m in raw_matches:
+        pair = tuple(sorted([m["team"], m["rival"]]))
+        if pair not in pair_results:
+            pair_results[pair] = []
+        
+        is_dup = False
+        for existing in pair_results[pair]:
+            if existing["sf"] == m["sf"] and existing["sa"] == m["sa"] and existing["phase"] == m["phase"]:
+                is_dup = True
+                break
+        
+        if not is_dup:
+            pair_results[pair].append(m)
+            
+    reub_set = set(teams)
+    unique_matches = []
+    for pair, r_list in pair_results.items():
+        if len(r_list) >= 2 and pair[0] in reub_set and pair[1] in reub_set:
+            r_list[0]["phase"] = "class"
+            r_list[-1]["phase"] = "reubic"
+        unique_matches.extend(r_list)
+        
     stats = {
         t: {
             "class_pts": 0.0,
@@ -401,50 +431,31 @@ def scrape_reubic_from_fixture(source_url, reub_teams, all_teams=None):
         }
         for t in teams
     }
-    seen_matches = set()
 
-    for team in all_teams:
-        url = links.get(team)
-        if not url:
+    for m in unique_matches:
+        a_name = m["team"]
+        b_name = m["rival"]
+        
+        if m["phase"] == "class":
+            if a_name in stats:
+                stats[a_name]["class_pts"] += points_for_match(m["sf"], m["sa"])
+            if b_name in stats:
+                stats[b_name]["class_pts"] += points_for_match(m["sa"], m["sf"])
             continue
-        try:
-            matches = _parse_team_matches(team, url, all_teams)
-        except Exception:
-            continue
 
-        for m in matches:
-            if m["id"] in seen_matches:
-                continue
-            seen_matches.add(m["id"])
-
-            a_name = m["team"]
-            b_name = m["rival"]
-            if a_name not in stats and b_name not in stats:
-                continue
-
-            if m["phase"] == "class":
-                if a_name in stats:
-                    stats[a_name]["class_pts"] += points_for_match(m["sf"], m["sa"])
-                if b_name in stats:
-                    stats[b_name]["class_pts"] += points_for_match(m["sa"], m["sf"])
-                continue
-
-            if m["phase"] != "reubic" or a_name not in stats or b_name not in stats:
-                continue
-
+        if m["phase"] == "reubic" and a_name in stats and b_name in stats:
             a = stats[a_name]
             b = stats[b_name]
             sf, sa = m["sf"], m["sa"]
+            
             a["PJ"] += 1
             b["PJ"] += 1
             a["SG"] += sf
             a["SP"] += sa
             b["SG"] += sa
             b["SP"] += sf
-            p_a = points_for_match(sf, sa)
-            p_b = points_for_match(sa, sf)
-            a["stage_pts"] += p_a
-            b["stage_pts"] += p_b
+            a["stage_pts"] += points_for_match(sf, sa)
+            b["stage_pts"] += points_for_match(sa, sf)
             if sf > sa:
                 a["PG"] += 1
                 b["PP"] += 1
@@ -476,6 +487,7 @@ def scrape_reubic_from_fixture(source_url, reub_teams, all_teams=None):
         ascending=[False, False, False],
     ).reset_index(drop=True)
     df["Pos"] = range(9, 9 + len(df))
+    
     return df[[
         "Pos", "Equipo", "PTS", "Arrastre 50%", "PTS Reubicación",
         "PG", "PJ", "PP", "DS", "SG", "SP"
@@ -516,21 +528,6 @@ def scrape_second_stage(source_url):
         },
     }
 
-def make_mock_second_stage():
-    campeonato = MOCK_CUARTA[:8]
-    reubic = MOCK_CUARTA[8:]
-    df_c = pd.DataFrame({
-        "Pos": range(1, 9),
-        "Equipo": campeonato,
-        "PTS": [40, 38, 36, 34, 32, 30, 28, 26],
-    })
-    df_r = pd.DataFrame({
-        "Pos": range(9, 17),
-        "Equipo": reubic,
-        "PTS": [25, 24, 23, 22, 21, 20, 19, 18],
-    })
-    return df_c, df_r
-
 
 def scrape_quinta(source_url):
     results = []
@@ -556,20 +553,6 @@ def scrape_quinta(source_url):
             seen.add(sig)
             out.append(item)
     return out
-
-def mock_quinta():
-    return [
-        pd.DataFrame({
-            "Pos": range(1, 7),
-            "Equipo": MOCK_QUINTA_A,
-            "PTS": [31, 29, 27, 25, 23, 21],
-        }),
-        pd.DataFrame({
-            "Pos": range(1, 7),
-            "Equipo": MOCK_QUINTA_B,
-            "PTS": [30, 28, 26, 24, 22, 20],
-        }),
-    ]
 
 
 # ============================================================
