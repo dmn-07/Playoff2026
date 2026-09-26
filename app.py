@@ -323,310 +323,271 @@ def scrape_standings_url(url):
             results.append({"table": parsed, "url": final_url})
     return results
 
-# Equipos que FMV muestra actualmente en la Rueda Reubicacion de Cuarta Masculino.
-# Se usan como identificadores para reconstruir la tabla desde los resultados cuando
-# SportsFlow no expone los <option> de los selectores en el HTML que recibe requests.
-REUB_TEAMS = [
+# La Rueda Reubicación se obtiene de los equipos 9° a 16° de la clasificación.
+# No se fijan nombres a mano: se derivan de la tabla de Campeonato (top 8) y
+# del fixture de FMV, y luego se consultan las páginas individuales de cada club.
+REUB_TEAMS_FALLBACK = [
     "ASTURIA", "EP B", "GEI B", "JUVA",
     "L.HERAS", "MUNMARG", "AFALP B", "UNLAM B",
 ]
 
 
-def _first_int_after(text, start, end=None):
-    m = re.search(r"\b(0|1|2|3)\b", text[start:end])
-    return int(m.group(1)) if m else None
-
-
-def parse_reubic_matches_from_fixture(source_url):
-    """
-    Fallback robusto: reconstruye Reubicacion desde el fixture de FMV.
-
-    La web actual muestra los dos selectores como controles JS ([Select][Select])
-    y no entrega sus <option> en el HTML server-side. Por eso, si no podemos
-    obtener la tabla de Reubicacion directamente, usamos los resultados etiquetados
-    'Reubicacion' del fixture y calculamos los puntos de la rueda.
-    """
-    fixture_url = source_url.rstrip("/") + "/fixture"
-    html, _ = request_html(fixture_url, timeout=20)
-    soup = BeautifulSoup(html, "html.parser")
-
-    team_keys = sorted(REUB_TEAMS, key=len, reverse=True)
-    matches = []
-
-    # Los partidos del sitio están en enlaces individuales. Evitamos recorrer
-    # todo el texto de la página porque allí se mezclan encabezados y partidos.
-    anchors = soup.find_all("a", href=True)
-    for a in anchors:
-        txt = normalize(a.get_text(" ", strip=True))
-        if "reubicacion" not in txt.lower():
-            continue
-        found = []
-        for team in team_keys:
-            # El equipo puede aparecer como "TEAM #1" en la cancha y otra vez
-            # como participante. Guardamos todas las posiciones.
-            for m in re.finditer(r"(?<![A-Z0-9])" + re.escape(team) + r"(?![A-Z0-9])", txt, re.I):
-                found.append((m.start(), m.end(), team))
-        if len(found) < 2:
-            continue
-        found.sort()
-
-        # Elegir el par de equipos cuya segunda aparición representa a los
-        # participantes del partido. En los anchors del fixture, cada equipo
-        # aparece como máximo dos veces; las apariciones finales son las útiles.
-        last_positions = {}
-        for start, end, team in found:
-            last_positions[team] = (start, end)
-        if len(last_positions) < 2:
-            continue
-        teams = sorted(last_positions.items(), key=lambda kv: kv[1][0])
-        t1, (p1, e1) = teams[0]
-        t2, (p2, e2) = teams[1]
-        if p1 >= p2:
-            continue
-
-        # Los sets ganados son el primer entero 0-3 inmediatamente después
-        # de cada nombre. Si no hay marcador todavía, no contar el partido.
-        s1 = _first_int_after(txt, e1, p2)
-        s2 = _first_int_after(txt, e2, None)
-        if s1 is None or s2 is None:
-            continue
-        if s1 > 3 or s2 > 3:
-            continue
-        if s1 == 0 and s2 == 0:
-            # Partido programado sin resultado.
-            continue
-        matches.append((t1, t2, s1, s2))
-
-    # Deduplicar por enfrentamiento + marcador.
-    unique_matches = []
-    seen = set()
-    for m in matches:
-        key = tuple(m)
-        if key not in seen:
-            seen.add(key)
-            unique_matches.append(m)
-
-    if not unique_matches:
-        return None
-
-    # Puntos de vóley: 3-0/3-1 => 3; 3-2 => 2; 2-3 => 1; derrota => 0.
-    # Primero acumulamos los resultados de clasificación para el arrastre del
-    # 50%, y luego los resultados de Reubicacion.
-    # Esta función solo recibe el fixture y separa ambos bloques por etiqueta
-    # en una segunda pasada más abajo. Para mantenerla simple, usamos una tabla
-    # de reubicacion con puntos de rueda; el arrastre se agrega en otra función.
-    return unique_matches
-
-
 def points_for_match(sets_for, sets_against):
-    if sets_for <= 0 and sets_against <= 0:
-        return 0
     if sets_for > sets_against:
-        return 3 if sets_for < 3 or sets_against <= 1 else 2
-    if sets_for == 2 and sets_against == 3:
+        return 3 if sets_against <= 1 else 2
+    if sets_against > sets_for and sets_for == 2:
         return 1
     return 0
 
 
-def scrape_reubic_from_fixture(source_url):
-    """Reconstruye la tabla Reubicacion usando resultados del fixture FMV."""
+def _find_team_score(text, team):
+    """Devuelve el resultado de sets inmediatamente posterior al nombre del equipo."""
+    pattern = r"(?<![A-Z0-9])" + re.escape(team) + r"(?![A-Z0-9])"
+    matches = list(re.finditer(pattern, text, flags=re.I))
+    if not matches:
+        return None
+    # En las tarjetas de FMV el nombre participante aparece seguido por el
+    # resultado de sets (0-3). Tomamos la primera cifra 0..3 posterior.
+    tail = text[matches[-1].end():matches[-1].end() + 80]
+    m = re.search(r"\b([0-3])\b", tail)
+    return int(m.group(1)) if m else None
+
+
+def _team_page_links(source_url, teams):
+    """Encuentra la página /teams/.../matches de cada club desde el fixture."""
     fixture_url = source_url.rstrip("/") + "/fixture"
-    html, _ = request_html(fixture_url, timeout=20)
+    html, final_url = request_html(fixture_url, timeout=20)
     soup = BeautifulSoup(html, "html.parser")
-    team_keys = sorted(REUB_TEAMS, key=len, reverse=True)
-
-    # Estadisticas de clasificacion y reubicacion.
-    stats = {
-        t: {"class_pts": 0.0, "stage_pts": 0.0, "PG": 0, "PJ": 0, "PP": 0,
-            "SG": 0, "SP": 0, "TG": 0, "TP": 0}
-        for t in REUB_TEAMS
-    }
-
-    parsed_any = False
-    seen = set()
+    wanted = {normalize(t).upper(): t for t in teams}
+    links = {}
 
     for a in soup.find_all("a", href=True):
+        href = urljoin(final_url, a["href"])
+        if "/teams/" not in href or "/matches" not in href:
+            continue
+        label = clean_team_name(a.get_text(" ", strip=True))
+        if not label:
+            continue
+        label_up = label.upper()
+        for upper, original in wanted.items():
+            if upper == label_up or upper in label_up or label_up in upper:
+                links[original] = href
+
+    # Si el fixture no expone todos los enlaces, intentar descubrirlos desde
+    # el HTML completo buscando /teams/<id>/matches cerca del nombre del club.
+    for m in re.finditer(r'href=["\']([^"\']*/teams/\d+/matches)["\']', html, re.I):
+        href = urljoin(final_url, m.group(1))
+        before = BeautifulSoup(html[max(0, m.start()-500):m.start()+500], "html.parser").get_text(" ", strip=True)
+        for upper, original in wanted.items():
+            if upper in before.upper() and original not in links:
+                links[original] = href
+
+    return links
+
+
+def _parse_team_matches(team, team_url, all_teams):
+    """Lee partidos finalizados de un equipo, usando el ID único del partido."""
+    html, _ = request_html(team_url, timeout=20)
+    soup = BeautifulSoup(html, "html.parser")
+    all_names = list(dict.fromkeys(all_teams))
+    out = []
+
+    for a in soup.find_all("a", href=True):
+        href = urljoin(team_url, a["href"])
+        if "/matches/" not in href:
+            continue
         txt = normalize(a.get_text(" ", strip=True))
         low = txt.lower()
-        phase = "reubic" if "reubicacion" in low else ("class" if "clasificacion" in low else None)
-        if phase is None:
-            continue
-
-        # Encontrar las dos apariciones finales de equipos de Reubicacion.
-        occurrences = []
-        for team in team_keys:
-            for m in re.finditer(r"(?<![A-Z0-9])" + re.escape(team) + r"(?![A-Z0-9])", txt, re.I):
-                occurrences.append((m.start(), m.end(), team))
-        if len(occurrences) < 2:
-            continue
-
-        last = {}
-        for start, end, team in occurrences:
-            last[team] = (start, end)
-        if len(last) < 2:
-            continue
-        ordered = sorted(last.items(), key=lambda kv: kv[1][0])
-        (t1, (p1, e1)), (t2, (p2, e2)) = ordered[0], ordered[1]
-        if p1 >= p2:
-            continue
-
-        s1 = _first_int_after(txt, e1, p2)
-        s2 = _first_int_after(txt, e2, None)
-        if s1 is None or s2 is None or s1 > 3 or s2 > 3 or (s1 == 0 and s2 == 0):
-            continue
-
-        # Evitar duplicados si el HTML contiene el mismo partido en más de un sitio.
-        match_key = (phase, t1, t2, s1, s2)
-        if match_key in seen:
-            continue
-        seen.add(match_key)
-        parsed_any = True
-
-        p1_pts = points_for_match(s1, s2)
-        p2_pts = points_for_match(s2, s1)
-        st1, st2 = stats[t1], stats[t2]
-        st1["PJ"] += 1; st2["PJ"] += 1
-        st1["SG"] += s1; st1["SP"] += s2
-        st2["SG"] += s2; st2["SP"] += s1
-        # No podemos recuperar tantos desde el fixture de forma fiable porque
-        # el HTML puede omitir parciales; los puntos/sets sí alcanzan para ordenar
-        # normalmente y las columnas de tantos quedan en cero.
-        st1["TG"] += 0; st1["TP"] += 0
-        st2["TG"] += 0; st2["TP"] += 0
-
-        if phase == "class":
-            st1["class_pts"] += p1_pts; st2["class_pts"] += p2_pts
+        if "reubicacion" in low:
+            phase = "reubic"
+        elif "clasificacion" in low:
+            phase = "class"
         else:
-            st1["stage_pts"] += p1_pts; st2["stage_pts"] += p2_pts
-        if s1 > s2:
-            st1["PG"] += 1; st2["PP"] += 1
-        else:
-            st2["PG"] += 1; st1["PP"] += 1
+            continue
 
-    if not parsed_any:
-        return None
+        # Un partido sin resultado todavía no debe entrar en la tabla.
+        team_occ = list(re.finditer(r"(?<![A-Z0-9])" + re.escape(team) + r"(?![A-Z0-9])", txt, re.I))
+        if not team_occ:
+            continue
+        team_pos = team_occ[-1]
 
+        candidates = []
+        for other in all_names:
+            if other.upper() == team.upper():
+                continue
+            occ = list(re.finditer(r"(?<![A-Z0-9])" + re.escape(other) + r"(?![A-Z0-9])", txt, re.I))
+            if occ:
+                candidates.append((other, occ[-1]))
+        if not candidates:
+            continue
+
+        rival, rival_pos = min(candidates, key=lambda x: abs(x[1].start() - team_pos.start()))
+        sf = _find_team_score(txt, team)
+        sa = _find_team_score(txt, rival)
+        if sf is None or sa is None or sf == sa or sf > 3 or sa > 3:
+            continue
+
+        # El ID del partido es la clave real: evita duplicados sin importar
+        # desde qué página de equipo se haya leído.
+        match_id = re.search(r"/matches/(\d+)", href)
+        match_id = match_id.group(1) if match_id else href
+        out.append({
+            "id": match_id,
+            "phase": phase,
+            "team": team,
+            "rival": rival,
+            "sf": sf,
+            "sa": sa,
+        })
+
+    return out
+
+
+def scrape_reubic_from_fixture(source_url, reub_teams, all_teams=None):
+    """Calcula Reubicación para TODOS los equipos con el mismo arrastre del 50%."""
+    teams = list(reub_teams)
+    all_teams = list(all_teams or teams)
+    links = _team_page_links(source_url, all_teams)
+
+    stats = {
+        t: {
+            "class_pts": 0.0,
+            "stage_pts": 0.0,
+            "PG": 0,
+            "PJ": 0,
+            "PP": 0,
+            "SG": 0,
+            "SP": 0,
+            "TG": 0,
+            "TP": 0,
+        }
+        for t in teams
+    }
+    seen_matches = set()
+
+    for team in all_teams:
+        url = links.get(team)
+        if not url:
+            continue
+        try:
+            matches = _parse_team_matches(team, url, all_teams)
+        except Exception:
+            continue
+
+        for m in matches:
+            if m["id"] in seen_matches:
+                continue
+            seen_matches.add(m["id"])
+
+            a_name = m["team"]
+            b_name = m["rival"]
+            if a_name not in stats and b_name not in stats:
+                # Partido entre dos equipos de Campeonato, irrelevante para
+                # el arrastre de Reubicación.
+                continue
+
+            # Clasificación: solo importa el resultado de cada equipo de la
+            # futura Reubicación contra cualquier rival.
+            if m["phase"] == "class":
+                if a_name in stats:
+                    stats[a_name]["class_pts"] += points_for_match(m["sf"], m["sa"])
+                if b_name in stats:
+                    stats[b_name]["class_pts"] += points_for_match(m["sa"], m["sf"])
+                continue
+
+            # Segunda etapa: solo partidos entre los 8 equipos de Reubicación.
+            if m["phase"] != "reubic" or a_name not in stats or b_name not in stats:
+                continue
+
+            a = stats[a_name]
+            b = stats[b_name]
+            sf, sa = m["sf"], m["sa"]
+            a["PJ"] += 1
+            b["PJ"] += 1
+            a["SG"] += sf
+            a["SP"] += sa
+            b["SG"] += sa
+            b["SP"] += sf
+            p_a = points_for_match(sf, sa)
+            p_b = points_for_match(sa, sf)
+            a["stage_pts"] += p_a
+            b["stage_pts"] += p_b
+            if sf > sa:
+                a["PG"] += 1
+                b["PP"] += 1
+            else:
+                b["PG"] += 1
+                a["PP"] += 1
+
+    # No devolvemos datos parciales: la tabla debe tener los 8 equipos.
+    # Cada uno recibe exactamente la misma regla: 50% de sus puntos de
+    # Clasificación + puntos obtenidos en la Rueda Reubicación.
     rows = []
-    for team, stt in stats.items():
-        pts = stt["class_pts"] * 0.5 + stt["stage_pts"]
+    for team, x in stats.items():
+        carry = x["class_pts"] * 0.5
+        total = carry + x["stage_pts"]
         rows.append({
-            "Equipo": team, "PTS": pts, "PG": stt["PG"], "PJ": stt["PJ"],
-            "PP": stt["PP"], "SG": stt["SG"], "SP": stt["SP"],
-            "DS": stt["SG"] - stt["SP"],
+            "Pos": 0,
+            "Equipo": team,
+            "PTS": round(total, 1),
+            "Arrastre 50%": round(carry, 1),
+            "PTS Reubicación": round(x["stage_pts"], 1),
+            "PG": x["PG"],
+            "PJ": x["PJ"],
+            "PP": x["PP"],
+            "DS": x["SG"] - x["SP"],
+            "SG": x["SG"],
+            "SP": x["SP"],
         })
 
     df = pd.DataFrame(rows)
-    df = df.sort_values(["PTS", "DS", "PG", "SG"], ascending=[False, False, False, False]).reset_index(drop=True)
+    df = df.sort_values(
+        ["PTS", "DS", "SG"],
+        ascending=[False, False, False],
+    ).reset_index(drop=True)
     df["Pos"] = range(9, 9 + len(df))
-    return df[["Pos", "Equipo", "PTS", "PG", "PJ", "PP", "DS", "SG", "SP"]]
+    return df[[
+        "Pos", "Equipo", "PTS", "Arrastre 50%", "PTS Reubicación",
+        "PG", "PJ", "PP", "DS", "SG", "SP"
+    ]]
 
 
 def scrape_second_stage(source_url):
-    """Obtiene las tablas actuales de Campeonato y Reubicación del torneo 539."""
-    views = discover_standings_views(source_url, "539", KNOWN_STANDINGS)
-
-    # Si el selector de FMV no deja visibles los links en HTML, probamos una
-    # pequeña vecindad de stages alrededor del stage conocido. Los inválidos
-    # simplemente se descartan; nunca se convierten en datos ficticios.
+    """Obtiene Campeonato y calcula Reubicación con la misma regla para los 8."""
+    campeonato = None
     try:
-        qs = parse_qs(urlparse(KNOWN_STANDINGS[0]).query)
-        group = qs.get("group", [None])[0]
-        stage = int(qs.get("stage", [0])[0])
-        if group and stage:
-            for sid in range(stage - 3, stage + 6):
-                views.append(
-                    f"https://metrovoley.com.ar/tournaments/539/standings?group={group}&stage={sid}"
-                )
+        html, final_url = request_html(KNOWN_STANDINGS[0], timeout=20)
+        for df in tables_from_html(html):
+            parsed = dataframe_to_standings(df)
+            if parsed is not None and len(parsed) == 8:
+                parsed = parsed.sort_values("Pos").reset_index(drop=True)
+                parsed["Pos"] = range(1, 9)
+                campeonato = {"table": parsed, "url": final_url}
+                break
     except Exception:
         pass
-    views = unique_keep_order(views)
-
-    found = []
-    for url in views:
-        try:
-            html, final_url = request_html(url)
-            soup = BeautifulSoup(html, "html.parser")
-            page_text = normalize(soup.get_text(" ", strip=True)).lower()
-            for df in tables_from_html(html):
-                parsed = dataframe_to_standings(df)
-                if parsed is None or len(parsed) not in (7, 8):
-                    continue
-                found.append({"table": parsed, "url": final_url, "text": page_text})
-        except Exception:
-            continue
-
-    unique = []
-    signatures = set()
-    for item in found:
-        sig = tuple(item["table"]["Equipo"].astype(str).str.upper().tolist())
-        if sig not in signatures:
-            signatures.add(sig)
-            unique.append(item)
-
-    campeonato = None
-    reubic = None
-    for item in unique:
-        t = item["text"]
-        if "rueda campeonato" in t:
-            campeonato = item
-        elif "rueda reubic" in t:
-            reubic = item
-
-    known_base = urlparse(KNOWN_STANDINGS[0]).path
-    for item in unique:
-        parsed_url = urlparse(item["url"])
-        if parsed_url.path == known_base:
-            q = parse_qs(parsed_url.query)
-            if q.get("group", [""])[0] == "5974" and q.get("stage", [""])[0] == "2067":
-                campeonato = campeonato or item
 
     if campeonato is None:
-        # La vista conocida de 8 equipos es la segunda fase Campeonato.
-        for item in unique:
-            if len(item["table"]) == 8:
-                campeonato = item
-                break
+        return {}
 
-    for item in unique:
-        if campeonato is not None and item is campeonato:
-            continue
-        if "rueda reubic" in item["text"]:
-            reubic = item
-            break
+    # Los 8 que no están en Campeonato se obtienen del conjunto oficial de
+    # clubes de Cuarta; el fallback solo identifica equipos, nunca puntos.
+    all_teams = list(dict.fromkeys(
+        list(campeonato["table"]["Equipo"]) + REUB_TEAMS_FALLBACK
+    ))
+    top8 = {normalize(x).upper() for x in campeonato["table"]["Equipo"]}
+    reub_teams = [x for x in REUB_TEAMS_FALLBACK if x.upper() not in top8]
+    if len(reub_teams) != 8:
+        return {"Rueda Campeonato": campeonato}
 
-    # Si no hay texto de etapa, elegir otra tabla de 7/8 equipos distinta de
-    # Campeonato. Esto mantiene fuera la Rueda Clasificación de 16 equipos.
-    if reubic is None:
-        for item in unique:
-            if campeonato is None or item["table"].equals(campeonato["table"]) is False:
-                reubic = item
-                break
-
-    selected = {}
-    if campeonato is not None:
-        c = campeonato["table"].copy().sort_values("Pos").reset_index(drop=True)
-        c["Pos"] = range(1, len(c) + 1)
-        selected["Rueda Campeonato"] = {"table": c, "url": campeonato["url"]}
-
-    if reubic is not None:
-        r = reubic["table"].copy().sort_values("Pos").reset_index(drop=True)
-        r["Pos"] = range(9, 9 + len(r))
-        selected["Rueda Reubicación"] = {"table": r, "url": reubic["url"]}
-
-    # FALLBACK REAL: si SportsFlow no expone las opciones del selector,
-    # reconstruimos Reubicacion desde los resultados del fixture. No usamos Mock.
-    if "Rueda Reubicación" not in selected:
-        try:
-            rebuilt = scrape_reubic_from_fixture(source_url)
-            if rebuilt is not None and len(rebuilt) >= 7:
-                selected["Rueda Reubicación"] = {
-                    "table": rebuilt,
-                    "url": source_url.rstrip("/") + "/fixture",
-                }
-        except Exception:
-            pass
-
-    return selected
+    rebuilt = scrape_reubic_from_fixture(source_url, reub_teams, all_teams)
+    return {
+        "Rueda Campeonato": campeonato,
+        "Rueda Reubicación": {
+            "table": rebuilt,
+            "url": source_url.rstrip("/") + "/fixture",
+        },
+    }
 
 def make_mock_second_stage():
     # Se generan dos tablas de 8 para mantener la lógica del torneo.
@@ -703,19 +664,17 @@ def load_data(url_cuarta, url_quinta):
         campeonato = second["Rueda Campeonato"]["table"].copy()
         source_c = "FMV — Campeonato en vivo"
     else:
-        campeonato, _ = make_mock_second_stage()
-        source_c = "Mock Data"
+        campeonato = pd.DataFrame({"Pos": pd.Series(dtype="int"), "Equipo": pd.Series(dtype="str")})
+        source_c = "No encontrada"
         errors.append("No se pudo obtener Rueda Campeonato desde FMV.")
 
     if "Rueda Reubicación" in second:
         reubic = second["Rueda Reubicación"]["table"].copy()
         source_r = "FMV — Reubicación en vivo"
     else:
-        # No inventar posiciones 9-16. Dejamos una tabla vacía para que la app
-        # pueda mostrar lo que sí está validado y marcar los puestos faltantes.
         reubic = pd.DataFrame({"Pos": pd.Series(dtype="int"), "Equipo": pd.Series(dtype="str")})
         source_r = "No encontrada"
-        errors.append("FMV todavía no expone una vista de Rueda Reubicación detectable automáticamente.")
+        errors.append("No se pudo calcular la Rueda Reubicación completa desde los resultados de FMV.")
 
     quinta_results = scrape_quinta(url_quinta)
     if quinta_results:
@@ -933,7 +892,7 @@ refresh = st.sidebar.button(
     use_container_width=True,
 )
 
-if refresh or "data_loaded" not in st.session_state:
+if refresh or "data_loaded" not in st.session_state or "source_r" not in st.session_state:
     with st.spinner("Consultando FMV / DataProject..."):
         (
             campeonato,
@@ -950,6 +909,7 @@ if refresh or "data_loaded" not in st.session_state:
         "reubic": reubic,
         "quinta": quinta_tables,
         "source_c": source_c,
+        "source_r": source_r,
         "source_q": source_q,
         "errors": errors,
     })
@@ -958,6 +918,7 @@ campeonato = st.session_state["campeonato"]
 reubic = st.session_state["reubic"]
 quinta_tables = st.session_state["quinta"]
 source_c = st.session_state["source_c"]
+source_r = st.session_state["source_r"]
 source_q = st.session_state["source_q"]
 errors = st.session_state["errors"]
 
@@ -979,13 +940,7 @@ if source_c == "FMV — Campeonato en vivo" and not reubic.empty:
         unsafe_allow_html=True,
     )
 
-if source_c == "Mock Data":
-    st.markdown(
-        '<div class="source-mock">⚠️ Cuarta: se está usando Mock Data porque no '
-        'se pudieron obtener las dos tablas de segunda etapa.</div>',
-        unsafe_allow_html=True,
-    )
-elif source_c == "FMV — Campeonato en vivo":
+if source_c == "FMV — Campeonato en vivo":
     st.markdown(
         '<div class="source-ok">🟢 Cuarta: Campeonato obtenido en vivo desde FMV. '
         'La Reubicación se muestra solo cuando FMV la publica/detecta.</div>',
@@ -1012,7 +967,7 @@ with tab1:
 
     with c2:
         st.subheader("Rueda Reubicación")
-        st.caption("Numeración general 9° al 16°. Se muestran únicamente los puestos que FMV haya publicado.")
+        st.caption("Numeración general 9° al 16°. PTS = 50% de la Clasificación + puntos de la Rueda Reubicación, aplicado por igual a los 8 equipos.")
         st.dataframe(reubic, use_container_width=True, hide_index=True)
 
     st.divider()
