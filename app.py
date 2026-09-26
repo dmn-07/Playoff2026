@@ -685,7 +685,7 @@ def load_data(url_cuarta, url_quinta):
         source_q = "No encontrada"
         errors.append("No se pudieron localizar las tablas de Quinta en la web pública de FMV.")
 
-    return campeonato, reubic, quinta_tables, source_c, source_q, errors
+    return campeonato, reubic, quinta_tables, source_c, source_r, source_q, errors
 
 
 # ============================================================
@@ -899,6 +899,7 @@ if refresh or "data_loaded" not in st.session_state or "source_r" not in st.sess
             reubic,
             quinta_tables,
             source_c,
+            source_r,
             source_q,
             errors,
         ) = load_data(url_cuarta, url_quinta)
