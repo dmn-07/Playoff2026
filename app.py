@@ -472,15 +472,30 @@ def _find_team_score(text, team):
 def _team_page_links(source_url, teams):
     """Descubre las páginas /teams/.../matches de todos los clubes.
 
-    El fixture de FMV no siempre contiene enlaces directos a los equipos.
-    Por eso también inspeccionamos una ficha de equipo conocida: su tabla de
-    clasificación contiene enlaces a las 16 fichas y permite descubrir los
-    IDs sin hardcodear puntos ni resultados.
+    FMV no siempre publica los enlaces de los equipos directamente en el
+    fixture. En ese caso el fixture sí contiene enlaces a los partidos; cada
+    página de partido contiene los enlaces de los dos equipos. Usamos esos
+    enlaces como puente para descubrir los 8 equipos de Reubicación.
     """
     fixture_url = source_url.rstrip("/") + "/fixture"
     seed_urls = [fixture_url, "https://metrovoley.com.ar/teams/5531"]  # MUNMARG
     wanted = {normalize(t).upper(): t for t in teams}
     links = {}
+
+    def register_team_link(label, href):
+        label_up = clean_team_name(label).upper()
+        if not label_up:
+            return
+        # FMV puede mostrar "ASTURIA A", "MUNMARG A", etc.; los nombres
+        # usados por la tabla son "ASTURIA", "MUNMARG", etc.
+        for upper, original in wanted.items():
+            if (
+                label_up == upper
+                or label_up.startswith(upper + " ")
+                or upper in label_up
+            ):
+                links[original] = href.rstrip("/") + "/matches"
+                return
 
     for page_url in seed_urls:
         try:
@@ -489,29 +504,35 @@ def _team_page_links(source_url, teams):
             continue
         soup = BeautifulSoup(html, "html.parser")
 
+        # Camino 1: enlaces de equipos que estén directamente en la página.
         for a in soup.find_all("a", href=True):
             href = urljoin(final_url, a["href"])
-            if "/teams/" not in href:
-                continue
-            label = clean_team_name(a.get_text(" ", strip=True))
-            if not label:
-                continue
-            label_up = label.upper()
-            # Normalizar el nombre mostrado por FMV (por ejemplo, GEI B).
-            for upper, original in wanted.items():
-                if upper == label_up or upper in label_up or label_up in upper:
-                    links[original] = href.rstrip("/") + "/matches"
+            if "/teams/" in href:
+                register_team_link(a.get_text(" ", strip=True), href)
 
-        # Algunos nombres están en texto alrededor del enlace de imagen.
-        # Buscamos cada equipo cerca de cualquier /teams/<id>.
-        for m in re.finditer(r'href=["\']([^"\']*/teams/(\d+))(?:/matches)?["\']', html, re.I):
-            href = urljoin(final_url, m.group(1))
-            lo = max(0, m.start() - 450)
-            hi = min(len(html), m.end() + 450)
-            nearby = BeautifulSoup(html[lo:hi], "html.parser").get_text(" ", strip=True).upper()
-            for upper, original in wanted.items():
-                if upper in nearby and original not in links:
-                    links[original] = href.rstrip("/") + "/matches"
+        # Camino 2: el fixture suele tener /matches/<id>, pero no /teams/<id>.
+        # Abrimos una muestra de partidos para descubrir los enlaces de equipos.
+        match_urls = []
+        for a in soup.find_all("a", href=True):
+            href = urljoin(final_url, a["href"])
+            if "/matches/" in href and href not in match_urls:
+                match_urls.append(href)
+            if len(match_urls) >= 32:
+                break
+
+        for match_url in match_urls:
+            try:
+                match_html, match_final = request_html(match_url, timeout=15)
+            except Exception:
+                continue
+            msoup = BeautifulSoup(match_html, "html.parser")
+            for a in msoup.find_all("a", href=True):
+                href = urljoin(match_final, a["href"])
+                if "/teams/" in href:
+                    register_team_link(a.get_text(" ", strip=True), href)
+
+        if len(links) == len(wanted):
+            break
 
     return links
 
