@@ -786,7 +786,7 @@ def load_data(url_cuarta, url_quinta):
         source_q = "No encontrada"
         errors.append("No se pudieron localizar las tablas de Quinta en la web pública de FMV.")
 
-    return campeonato, reubic, quinta_tables, source_c, source_q, errors
+    return campeonato, reubic, quinta_tables, source_c, source_r, source_q, errors
 
 
 # ============================================================
