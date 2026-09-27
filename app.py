@@ -227,121 +227,77 @@ def dataframe_to_standings(df):
 
 
 def extract_standings_links(source_url, html, final_url, tournament_id="539"):
-    """
-    Encuentra todas las vistas de posiciones.
+    """Descubre las vistas oficiales de Posiciones de FMV.
 
-    FMV tiene dos selectores en la página de Posiciones: uno para la etapa
-    (p. ej. Primera/Segunda etapa) y otro para la rueda (Campeonato/Reubicación).
-    Es importante leer los <select>/<option>, porque esas opciones no aparecen
-    como enlaces <a> y por eso el scraper anterior nunca llegaba a Reubicación.
+    FMV muestra Segunda etapa y sus ruedas mediante selectores HTML.
+    No se reconstruyen resultados: se obtienen las URLs de las opciones
+    oficiales "Rueda Campeonato" y "Rueda Reubicación" y se leen sus tablas.
     """
     links = []
     soup = BeautifulSoup(html, "html.parser")
     standings_base = f"https://metrovoley.com.ar/tournaments/{tournament_id}/standings"
 
+    # Enlaces explícitos de posiciones.
     for a in soup.find_all("a", href=True):
         href = urljoin(final_url, a["href"])
         if f"/tournaments/{tournament_id}/standings" in href.lower():
             links.append(href)
 
-    # URLs absolutas y relativas embebidas en scripts/JSON.
-    patterns = [
-        rf'https?://[^"\'<> ]*/tournaments/{tournament_id}/standings[^"\'<> ]*',
-        rf'/tournaments/{tournament_id}/standings[^"\'<> ]*',
-    ]
-    for pattern in patterns:
-        for m in re.findall(pattern, html, flags=re.I):
-            links.append(urljoin(final_url, m.replace("&amp;", "&")))
+    # URLs que el frontend pueda tener embebidas.
+    for m in re.findall(
+        rf"(?:https?:)?//[^\"'<> ]*/tournaments/{tournament_id}/standings[^\"'<> ]*|"
+        rf"/tournaments/{tournament_id}/standings[^\"'<> ]*",
+        html,
+        flags=re.I,
+    ):
+        links.append(urljoin(final_url, m.replace("&amp;", "&")))
 
-    # Capturar pares group/stage que ya estén escritos en HTML/JS.
-    pair_patterns = [
-        (r'[?&]group=(\d+)[^"\'<>]{0,220}[?&]stage=(\d+)', False),
-        (r'[?&]stage=(\d+)[^"\'<>]{0,220}[?&]group=(\d+)', True),
-        (r'"group"\s*:\s*"?(\d+)"?[^{}]{0,220}?"stage"\s*:\s*"?(\d+)"?', False),
-        (r'"stage"\s*:\s*"?(\d+)"?[^{}]{0,220}?"group"\s*:\s*"?(\d+)"?', True),
-    ]
-    for pat, reversed_order in pair_patterns:
-        for m in re.finditer(pat, html, flags=re.I):
-            if reversed_order:
-                stage, group = m.group(1), m.group(2)
-            else:
-                group, stage = m.group(1), m.group(2)
-            links.append(f"{standings_base}?group={group}&stage={stage}")
-
-    # ===== CLAVE: leer los dos selectores reales de FMV =====
-    selects = []
+    # ------------------------------------------------------------
+    # LO IMPORTANTE: leer directamente los <option> de FMV.
+    # ------------------------------------------------------------
+    all_options = []
     for sel in soup.find_all("select"):
-        options = []
         for opt in sel.find_all("option"):
             value = normalize(opt.get("value"))
             label = normalize(opt.get_text(" ", strip=True))
             if value:
-                options.append((value, label))
-        if options:
-            meta = " ".join([
-                normalize(sel.get("name")),
-                normalize(sel.get("id")),
-                normalize(sel.get("class")),
-                normalize(sel.get("data-param")),
-                normalize(sel.get("data-name")),
-            ]).lower()
-            selects.append({"meta": meta, "options": options})
+                all_options.append((value, label))
 
-    # Identificar cuál selector es group y cuál stage usando los valores que
-    # conocemos de la URL actual. Si el HTML no trae esos valores, también
-    # usamos el nombre/id del selector.
-    group_options = []
-    stage_options = []
-    for sel in selects:
-        meta = sel["meta"]
-        if "group" in meta or "rueda" in meta or "zona" in meta:
-            group_options.extend(sel["options"])
-        if "stage" in meta or "etapa" in meta or "fase" in meta:
-            stage_options.extend(sel["options"])
-
-    # Fallback por valores conocidos de la vista actual.
-    if not group_options:
-        for sel in selects:
-            if any(v == "5974" for v, _ in sel["options"]):
-                group_options = sel["options"]
-                break
-    if not stage_options:
-        for sel in selects:
-            if any(v == "2067" for v, _ in sel["options"]):
-                stage_options = sel["options"]
-                break
-
-    # Fallback final: cualquier selector distinto del de group se considera
-    # candidato a stage. Esto permite tolerar cambios menores del frontend.
-    if group_options and not stage_options:
-        for sel in selects:
-            if sel["options"] is not group_options:
-                stage_options.extend(sel["options"])
-
-    current_stage = "2067"
-    for value, label in stage_options:
-        if value == "2067" or "segunda etapa" in label.lower():
-            current_stage = value
+    # Detectar la etapa "Segunda etapa".
+    stage = None
+    for value, label in all_options:
+        low = label.lower()
+        if "segunda etapa" in low or "segunda" in low and "etapa" in low:
+            stage = value
             break
 
-    # Construir específicamente las vistas de Segunda etapa / Campeonato y
-    # Segunda etapa / Reubicación a partir de las opciones que muestra FMV.
-    for value, label in group_options:
+    # Si la página conocida ya trae stage, usarlo como respaldo.
+    if stage is None:
+        parsed = urlparse(final_url)
+        qs = parse_qs(parsed.query)
+        stage = qs.get("stage", [None])[0]
+    if stage is None:
+        stage = "2067"
+
+    # Detectar las dos ruedas por el texto que muestra FMV.
+    for value, label in all_options:
         low = label.lower()
         if "campeonato" in low or "reubic" in low:
-            links.append(f"{standings_base}?group={value}&stage={current_stage}")
+            links.append(f"{standings_base}?group={value}&stage={stage}")
 
-    # Si el selector no etiqueta claramente las ruedas, probar combinaciones
-    # con la etapa actual. Luego el parser de tablas/etapas decide cuál es válida.
-    if group_options:
-        for value, label in group_options:
-            if value != "5974":
-                links.append(f"{standings_base}?group={value}&stage={current_stage}")
+    # También conservar cualquier combinación group/stage que el HTML ya
+    # tenga escrita, pero sin inventar IDs.
+    pairs = []
+    for m in re.finditer(r"[?&]group=(\d+)[^\"'<>]{0,220}[?&]stage=(\d+)", html, flags=re.I):
+        pairs.append((m.group(1), m.group(2)))
+    for m in re.finditer(r"[?&]stage=(\d+)[^\"'<>]{0,220}[?&]group=(\d+)", html, flags=re.I):
+        pairs.append((m.group(2), m.group(1)))
+    for group, stage_id in pairs:
+        links.append(f"{standings_base}?group={group}&stage={stage_id}")
 
     if "/standings" in source_url.lower():
         links.append(source_url)
     return unique_keep_order(links)
-
 
 def discover_standings_views(source_url, tournament_id="539", known=None):
     """Descubre vistas de posiciones, incluyendo las opciones de los selectores FMV."""
@@ -728,77 +684,66 @@ def scrape_reubic_from_fixture(source_url, reub_teams, all_teams=None):
 
 
 def scrape_second_stage(source_url):
-    """Obtiene Campeonato y Reubicación de Cuarta 2026.
+    """Lee exclusivamente las tablas oficiales de Segunda etapa de FMV.
 
-    Prioridad:
-    1. Tabla oficial de FMV.
-    2. Si FMV no expone la vista Reubicación como selector/enlace, se usa
-       como respaldo la información de partidos de los mismos ocho equipos y
-       se aplica la regla oficial de arrastre del 50%.
-
-    Nunca se reemplaza una tabla real por Mock Data.
+    No calcula puntos, no consulta partidos de equipos y no reconstruye
+    Reubicación. FMV ya publica el PTS definitivo en cada tabla.
     """
     campeonato = None
     reubic = None
 
-    # La vista oficial conocida de Campeonato se consulta directamente.
-    try:
-        for item in scrape_standings_url(KNOWN_STANDINGS[0]):
-            table = item["table"].copy()
-            if len(table) == 8:
-                table = table.sort_values("Pos").reset_index(drop=True)
-                table["Pos"] = range(1, 9)
-                campeonato = {"table": table, "url": item["url"]}
-                break
-    except Exception:
-        pass
-
-    # Intentar descubrir la vista oficial de Reubicación.
     views = discover_standings_views(
         source_url,
         tournament_id="539",
         known=KNOWN_STANDINGS,
     )
 
-    championship_urls = {u.rstrip("/") for u in KNOWN_STANDINGS}
     for url in views:
-        if url.rstrip("/") in championship_urls:
-            continue
         try:
-            tables = scrape_standings_url(url)
+            html, final_url = request_html(url)
+            tables = scrape_standings_url(final_url)
         except Exception:
             continue
+
+        page_text = BeautifulSoup(html, "html.parser").get_text(" ", strip=True).lower()
+        url_low = final_url.lower()
+
         for item in tables:
             table = item["table"].copy()
             if len(table) != 8:
                 continue
-            table = table.sort_values("Pos").reset_index(drop=True)
-            # Evitar aceptar otra vista de Campeonato repetida.
-            teams = set(table["Equipo"].astype(str).str.upper())
-            champ_teams = set() if campeonato is None else set(campeonato["table"]["Equipo"].astype(str).str.upper())
-            if champ_teams and teams == champ_teams:
+            if "PTS" not in table.columns:
                 continue
-            table["Pos"] = range(9, 17)
-            reubic = {"table": table, "url": item["url"]}
-            break
-        if reubic is not None:
-            break
 
-    # Fallback real para Reubicación: no inventa equipos ni puntos.
-    if reubic is None:
-        try:
-            fallback = scrape_reubic_from_fixture(
-                source_url,
-                REUB_TEAMS_FALLBACK,
-                all_teams=REUB_TEAMS_FALLBACK,
-            )
-            if fallback is not None and len(fallback) == 8:
-                reubic = {
-                    "table": fallback,
-                    "url": "FMV — partidos oficiales + regla de arrastre 50%",
-                }
-        except Exception:
-            reubic = None
+            table = table.sort_values("Pos").reset_index(drop=True)
+            teams = set(table["Equipo"].astype(str).str.upper())
+
+            # La propia página/URL determina la rueda. Si no hay texto,
+            # usamos el conjunto de equipos para no duplicar Campeonato.
+            is_reubic = "reubic" in page_text or "reubic" in url_low
+            is_champ = "campeonato" in page_text or "campeonato" in url_low
+
+            if is_reubic:
+                table["Pos"] = range(9, 17)
+                reubic = {"table": table, "url": final_url}
+            elif is_champ:
+                table["Pos"] = range(1, 9)
+                campeonato = {"table": table, "url": final_url}
+            elif campeonato is None:
+                # La URL conocida de group=5974/stage=2067 es la tabla de
+                # Campeonato actual. Se acepta únicamente esa vista como
+                # fallback de identificación, nunca como Reubicación.
+                if "group=5974" in url_low and "stage=2067" in url_low:
+                    table["Pos"] = range(1, 9)
+                    campeonato = {"table": table, "url": final_url}
+            else:
+                champ_teams = set(campeonato["table"]["Equipo"].astype(str).str.upper())
+                if teams != champ_teams and reubic is None:
+                    table["Pos"] = range(9, 17)
+                    reubic = {"table": table, "url": final_url}
+
+        if campeonato is not None and reubic is not None:
+            break
 
     result = {}
     if campeonato is not None:
