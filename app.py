@@ -281,20 +281,23 @@ def render_playoff(campeonato, reubicacion):
     s7 = team_at(campeonato, 7)
     s8 = team_at(campeonato, 8)
 
-    s9 = team_at(reubicacion, 9)
-    s10 = team_at(reubicacion, 10)
-    s11 = team_at(reubicacion, 11)
-    s12 = team_at(reubicacion, 12)
+    # La tabla de Reubicación tiene posiciones propias 1–8.
+    # En el Play Off corresponden a los puestos generales 9–16:
+    # Reubicación 1 = puesto general 9, ..., Reubicación 4 = puesto general 12.
+    r1 = team_at(reubicacion, 1)
+    r2 = team_at(reubicacion, 2)
+    r3 = team_at(reubicacion, 3)
+    r4 = team_at(reubicacion, 4)
 
     qta, qtb = quinta_placeholders()
 
     st.subheader("Octavos de Final")
     cols = st.columns(4)
     games = [
-        ("Octavos 1", s9, s10, "Ganador → Cuartos 1"),
+        ("Octavos 1", r1, r2, "Ganador → Cuartos 1"),
         ("Octavos 2", s6, f"1° Quinta: {qta} / {qtb}", "Ganador → Cuartos 2"),
-        ("Octavos 3", s8, s11, "Ganador → Cuartos 3"),
-        ("Octavos 4", s7, s12, "Ganador → Cuartos 4"),
+        ("Octavos 3", s8, r3, "Ganador → Cuartos 3"),
+        ("Octavos 4", s7, r4, "Ganador → Cuartos 4"),
     ]
     for col, game in zip(cols, games):
         with col:
