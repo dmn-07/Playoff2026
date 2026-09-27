@@ -226,24 +226,150 @@ def dataframe_to_standings(df):
     return out
 
 
-def extract_standings_links(source_url, html, final_url, tournament_id="539"):
-    """Descubre las vistas oficiales de Posiciones de FMV.
+def _plain(text):
+    """Texto comparable sin tildes, útil para etiquetas del frontend."""
+    import unicodedata
+    s = normalize(text).lower()
+    return "".join(
+        ch for ch in unicodedata.normalize("NFKD", s)
+        if not unicodedata.combining(ch)
+    )
 
-    FMV muestra Segunda etapa y sus ruedas mediante selectores HTML.
-    No se reconstruyen resultados: se obtienen las URLs de las opciones
-    oficiales "Rueda Campeonato" y "Rueda Reubicación" y se leen sus tablas.
+
+def _numeric_id(value):
+    """Devuelve un ID numérico si value es un entero/str entero."""
+    try:
+        n = int(str(value).strip())
+        return n if n > 0 else None
+    except Exception:
+        return None
+
+
+def _ids_near_label(html, label_words):
+    """Busca IDs de group/stage cerca de una etiqueta del frontend.
+
+    SportsFlow/FM​V puede entregar los selectores como JSON/RSC en vez de
+    <option>. Por eso no dependemos de una estructura HTML concreta.
+    """
+    found = []
+    text = html.replace('\\"', '"').replace('\\/', '/')
+    low = _plain(text)
+
+    for word in label_words:
+        target = _plain(word)
+        pos = 0
+        while True:
+            idx = low.find(target, pos)
+            if idx < 0:
+                break
+            # Una ventana amplia pero local: suele contener label + value/id.
+            lo = max(0, idx - 1800)
+            hi = min(len(text), idx + 1800)
+            chunk = text[lo:hi]
+
+            group_ids = []
+            stage_ids = []
+            # Variantes habituales de JSON/props/URL.
+            patterns_group = [
+                r'(?i)["\'](?:group|groupId|group_id|groupID)["\']\s*[:=]\s*["\']?(\d+)',
+                r'(?i)[?&]group=(\d+)',
+                r'(?i)["\'](?:value|id)["\']\s*[:=]\s*["\']?(\d+)'
+            ]
+            patterns_stage = [
+                r'(?i)["\'](?:stage|stageId|stage_id|stageID)["\']\s*[:=]\s*["\']?(\d+)',
+                r'(?i)[?&]stage=(\d+)'
+            ]
+            for pat in patterns_group:
+                group_ids += [int(x) for x in re.findall(pat, chunk)]
+            for pat in patterns_stage:
+                stage_ids += [int(x) for x in re.findall(pat, chunk)]
+
+            # Evitar capturar IDs enormes/irrelevantes.
+            group_ids = [x for x in group_ids if 1 <= x <= 100000]
+            stage_ids = [x for x in stage_ids if 1 <= x <= 100000]
+            for gid in group_ids:
+                for sid in (stage_ids or [2067]):
+                    found.append((gid, sid))
+            pos = idx + len(target)
+
+    return found
+
+
+def _extract_json_objects_from_scripts(soup):
+    """Devuelve objetos JSON encontrados en scripts sin asumir Next.js/React."""
+    objects = []
+    for script in soup.find_all("script"):
+        raw = script.string or script.get_text()
+        if not raw or len(raw) > 2_000_000:
+            continue
+        raw = raw.strip()
+        if not raw:
+            continue
+        # JSON puro.
+        if raw.startswith("{") or raw.startswith("["):
+            try:
+                import json
+                objects.append(json.loads(raw))
+            except Exception:
+                pass
+    return objects
+
+
+def _walk_labelled_ids(obj, inherited=None):
+    """Busca pares group/stage en objetos JSON donde aparece una rueda."""
+    import json
+    found = []
+    inherited = dict(inherited or {})
+
+    if isinstance(obj, dict):
+        local = dict(inherited)
+        for k, v in obj.items():
+            kl = _plain(k)
+            if kl in {"group", "groupid", "group_id", "groupid"}:
+                n = _numeric_id(v)
+                if n is not None:
+                    local["group"] = n
+            elif kl in {"stage", "stageid", "stage_id", "stageid"}:
+                n = _numeric_id(v)
+                if n is not None:
+                    local["stage"] = n
+
+        values_text = " ".join(
+            str(v) for v in obj.values()
+            if isinstance(v, (str, int, float))
+        )
+        label = _plain(values_text)
+        if "reubic" in label or "campeonato" in label:
+            if local.get("group"):
+                found.append((local["group"], local.get("stage", 2067), label[:180]))
+
+        for v in obj.values():
+            found.extend(_walk_labelled_ids(v, local))
+
+    elif isinstance(obj, list):
+        for v in obj:
+            found.extend(_walk_labelled_ids(v, inherited))
+
+    return found
+
+
+def extract_standings_links(source_url, html, final_url, tournament_id="539"):
+    """Descubre las vistas oficiales de Posiciones de Segunda Etapa.
+
+    IMPORTANTE: no reconstruye resultados. Busca las dos vistas que FMV ya
+    publica (Rueda Campeonato y Rueda Reubicación) y devuelve sus URLs.
     """
     links = []
     soup = BeautifulSoup(html, "html.parser")
     standings_base = f"https://metrovoley.com.ar/tournaments/{tournament_id}/standings"
 
-    # Enlaces explícitos de posiciones.
+    # 1) Enlaces normales.
     for a in soup.find_all("a", href=True):
         href = urljoin(final_url, a["href"])
         if f"/tournaments/{tournament_id}/standings" in href.lower():
             links.append(href)
 
-    # URLs que el frontend pueda tener embebidas.
+    # 2) URLs embebidas en HTML/JS/RSC.
     for m in re.findall(
         rf"(?:https?:)?//[^\"'<> ]*/tournaments/{tournament_id}/standings[^\"'<> ]*|"
         rf"/tournaments/{tournament_id}/standings[^\"'<> ]*",
@@ -252,66 +378,64 @@ def extract_standings_links(source_url, html, final_url, tournament_id="539"):
     ):
         links.append(urljoin(final_url, m.replace("&amp;", "&")))
 
-    # ------------------------------------------------------------
-    # LO IMPORTANTE: leer directamente los <option> de FMV.
-    # ------------------------------------------------------------
-    all_options = []
+    # 3) <select>/<option>, si el servidor los entrega.
+    options = []
     for sel in soup.find_all("select"):
         for opt in sel.find_all("option"):
             value = normalize(opt.get("value"))
             label = normalize(opt.get_text(" ", strip=True))
             if value:
-                all_options.append((value, label))
+                options.append((value, label))
 
-    # Detectar la etapa "Segunda etapa".
     stage = None
-    for value, label in all_options:
-        low = label.lower()
-        if "segunda etapa" in low or "segunda" in low and "etapa" in low:
+    for value, label in options:
+        if "segunda etapa" in _plain(label):
             stage = value
             break
-
-    # Si la página conocida ya trae stage, usarlo como respaldo.
     if stage is None:
         parsed = urlparse(final_url)
-        qs = parse_qs(parsed.query)
-        stage = qs.get("stage", [None])[0]
-    if stage is None:
-        stage = "2067"
+        stage = parse_qs(parsed.query).get("stage", ["2067"])[0]
 
-    # Detectar las dos ruedas por el texto que muestra FMV.
-    for value, label in all_options:
-        low = label.lower()
+    for value, label in options:
+        low = _plain(label)
         if "campeonato" in low or "reubic" in low:
-            links.append(f"{standings_base}?group={value}&stage={stage}")
+            # Si value ya es una URL, respetarla; si es un ID, usar group.
+            if "/standings" in value:
+                links.append(urljoin(final_url, value))
+            elif _numeric_id(value):
+                links.append(f"{standings_base}?group={value}&stage={stage}")
 
-    # También conservar cualquier combinación group/stage que el HTML ya
-    # tenga escrita, pero sin inventar IDs.
-    pairs = []
-    for m in re.finditer(r"[?&]group=(\d+)[^\"'<>]{0,220}[?&]stage=(\d+)", html, flags=re.I):
-        pairs.append((m.group(1), m.group(2)))
-    for m in re.finditer(r"[?&]stage=(\d+)[^\"'<>]{0,220}[?&]group=(\d+)", html, flags=re.I):
-        pairs.append((m.group(2), m.group(1)))
-    for group, stage_id in pairs:
-        links.append(f"{standings_base}?group={group}&stage={stage_id}")
+    # 4) El frontend puede guardar las opciones en JSON/RSC.
+    for gid, sid in _ids_near_label(html, ["Rueda Reubicación", "Rueda Reubicacion", "Reubicación", "Reubicacion"]):
+        links.append(f"{standings_base}?group={gid}&stage={sid}")
+    for gid, sid in _ids_near_label(html, ["Rueda Campeonato", "Campeonato"]):
+        links.append(f"{standings_base}?group={gid}&stage={sid}")
+
+    # 5) JSON puro dentro de <script>.
+    for obj in _extract_json_objects_from_scripts(soup):
+        for gid, sid, _label in _walk_labelled_ids(obj):
+            links.append(f"{standings_base}?group={gid}&stage={sid}")
+
+    # 6) Cualquier pareja explícita group/stage del HTML.
+    for m in re.finditer(r"[?&]group=(\d+)[^\"'<>]{0,1200}[?&]stage=(\d+)", html, flags=re.I):
+        links.append(f"{standings_base}?group={m.group(1)}&stage={m.group(2)}")
+    for m in re.finditer(r"[?&]stage=(\d+)[^\"'<>]{0,1200}[?&]group=(\d+)", html, flags=re.I):
+        links.append(f"{standings_base}?group={m.group(2)}&stage={m.group(1)}")
 
     if "/standings" in source_url.lower():
         links.append(source_url)
     return unique_keep_order(links)
 
+
 def discover_standings_views(source_url, tournament_id="539", known=None):
-    """Descubre vistas de posiciones, incluyendo las opciones de los selectores FMV."""
+    """Descubre todas las vistas de Posiciones del torneo."""
     candidates = list(known or [])
-
-    # Hay que inspeccionar la vista conocida porque allí están los <select> que
-    # contienen el ID de Reubicación aunque no exista un enlace <a> hacia ella.
-    seed_urls = unique_keep_order(candidates + [source_url])
     base = f"https://metrovoley.com.ar/tournaments/{tournament_id}/standings"
-    seed_urls.append(base)
+    seed_urls = unique_keep_order(candidates + [source_url, base])
 
-    for seed in unique_keep_order(seed_urls):
+    for seed in seed_urls:
         try:
-            html, final_url = request_html(seed)
+            html, final_url = request_html(seed, timeout=20)
             candidates.extend(extract_standings_links(seed, html, final_url, tournament_id))
         except Exception:
             continue
@@ -698,6 +822,20 @@ def scrape_second_stage(source_url):
         known=KNOWN_STANDINGS,
     )
 
+    # En algunas respuestas del frontend el selector de Segunda Etapa se
+    # hidrata del lado del navegador y sus <option> no aparecen en el HTML
+    # recibido por requests. En ese caso probamos únicamente IDs de GRUPO
+    # cercanos al grupo oficial conocido (5974). Esto sigue leyendo tablas
+    # oficiales de FMV: no calcula ni reconstruye ningún dato.
+    #
+    # La selección final se valida por la tabla encontrada y por su conjunto
+    # de equipos; nunca se acepta una tabla arbitraria como Reubicación.
+    for group_id in range(5970, 5986):
+        views.append(
+            f"https://metrovoley.com.ar/tournaments/539/standings?group={group_id}&stage=2067"
+        )
+    views = unique_keep_order(views)
+
     for url in views:
         try:
             html, final_url = request_html(url)
@@ -837,7 +975,7 @@ def load_data(url_cuarta, url_quinta):
     else:
         reubic = pd.DataFrame({"Pos": pd.Series(dtype="int"), "Equipo": pd.Series(dtype="str")})
         source_r = "No encontrada"
-        errors.append("No se pudo localizar la tabla oficial de Rueda Reubicación en FMV ni reconstruirla desde los partidos oficiales.")
+        errors.append("No se pudo localizar la tabla oficial de Rueda Reubicación en FMV.")
 
     quinta_results = scrape_quinta(url_quinta)
     if quinta_results:
